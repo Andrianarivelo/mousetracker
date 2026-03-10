@@ -17,6 +17,10 @@ RELIABLE_CONF_THRESHOLD = 0.40
 OCCLUSION_ENTER_FRAMES = 5
 # Velocity spike threshold multiplier (MAD-based, used in detect_velocity_swaps)
 VELOCITY_SPIKE_K = 4.0
+# Split a merged detection only when it is clearly larger than one animal.
+MERGE_AREA_RATIO_THRESHOLD = 1.35
+# Expand the candidate search box a bit so near-edge merges are still caught.
+MERGE_BBOX_MARGIN_PX = 24.0
 
 
 @dataclass
@@ -35,6 +39,8 @@ class TrackState:
     match_cost: float = 0.0
     # mouse IDs currently in occluded state (absent, position carried forward)
     occluded_ids: set = field(default_factory=set)
+    # mouse IDs carried by a synthetic split of a merged detection
+    merge_resolved_ids: set = field(default_factory=set)
 
 
 class IdentityTracker:
@@ -221,8 +227,19 @@ class IdentityTracker:
                 curr_hists[sid] = _mask_histogram(gray, mask)
 
         # ── Hungarian matching ─────────────────────────────────────────────────
-        # Prefer reliable state when available — more stable reference
-        ref_state = self._last_reliable_state or self._last_state
+        # Prefer the last reliable state while tracking is stable, but once a
+        # merge or occlusion happens switch to the freshest state so the split
+        # seeds keep moving with the merged cluster.
+        ref_state = self._select_reference_state() or self._last_state
+        curr_sam_masks, curr_bboxes, curr_probs, synthetic_sam_ids = (
+            self._augment_merged_masks(
+                frame_idx,
+                curr_sam_masks,
+                curr_bboxes,
+                curr_probs,
+                ref_state,
+            )
+        )
         prev_ids = sorted(ref_state.masks.keys())
         curr_sam_ids = list(curr_sam_masks.keys())
 
@@ -243,6 +260,8 @@ class IdentityTracker:
             state.centroids[mouse_id] = _centroid(mask)
             state.bboxes[mouse_id] = curr_bboxes.get(sam_id, (0, 0, 0, 0))
             state.confidences[mouse_id] = curr_probs.get(sam_id, 1.0)
+            if sam_id in synthetic_sam_ids:
+                state.merge_resolved_ids.add(mouse_id)
             r = prev_ids.index(mouse_id)
             c = curr_sam_ids.index(sam_id)
             max_cost = max(max_cost, cost[r, c])
@@ -277,7 +296,11 @@ class IdentityTracker:
         state.match_cost = max_cost
 
         # Flag ID switch only when all mice are visible
-        if max_cost > ID_SWITCH_COST_THRESHOLD and not state.occluded_ids:
+        if (
+            max_cost > ID_SWITCH_COST_THRESHOLD
+            and not state.occluded_ids
+            and not state.merge_resolved_ids
+        ):
             self.swap_log.append(frame_idx)
             logger.debug(f"Potential ID switch at frame {frame_idx} (cost={max_cost:.3f})")
 
@@ -287,7 +310,12 @@ class IdentityTracker:
             c for mid, c in state.confidences.items()
             if mid not in state.occluded_ids
         ]
-        if visible_confs and min(visible_confs) >= RELIABLE_CONF_THRESHOLD:
+        if (
+            visible_confs
+            and min(visible_confs) >= RELIABLE_CONF_THRESHOLD
+            and not state.occluded_ids
+            and not state.merge_resolved_ids
+        ):
             self._last_reliable_state = state
             # Update appearance histograms via EMA (α=0.1)
             if gray is not None:
@@ -471,6 +499,244 @@ class IdentityTracker:
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
+    def _select_reference_state(self) -> Optional[TrackState]:
+        """Pick the best reference state for the next frame assignment."""
+        if self._last_state is None:
+            return self._last_reliable_state
+        if self._last_reliable_state is None:
+            return self._last_state
+        if self._last_state.occluded_ids or self._last_state.merge_resolved_ids:
+            return self._last_state
+        return self._last_reliable_state
+
+    def _reference_mask(
+        self,
+        ref_state: TrackState,
+        mouse_id: int,
+    ) -> Optional[np.ndarray]:
+        """Use the freshest non-empty mask, falling back to the last reliable one."""
+        mask = ref_state.masks.get(mouse_id)
+        if mask is not None and np.any(mask):
+            return mask
+        if self._last_reliable_state is None:
+            return mask
+        reliable_mask = self._last_reliable_state.masks.get(mouse_id)
+        if reliable_mask is not None and np.any(reliable_mask):
+            return reliable_mask
+        return mask
+
+    def _reference_centroid(
+        self,
+        ref_state: TrackState,
+        mouse_id: int,
+    ) -> tuple[float, float]:
+        """Use the freshest centroid, with reliable-state fallback when needed."""
+        if mouse_id in ref_state.centroids:
+            return ref_state.centroids[mouse_id]
+        if self._last_reliable_state is not None:
+            return self._last_reliable_state.centroids.get(mouse_id, (0.0, 0.0))
+        return (0.0, 0.0)
+
+    def _augment_merged_masks(
+        self,
+        frame_idx: int,
+        curr_sam_masks: dict[int, np.ndarray],
+        curr_bboxes: dict[int, tuple[int, int, int, int]],
+        curr_probs: dict[int, float],
+        ref_state: TrackState,
+    ) -> tuple[
+        dict[int, np.ndarray],
+        dict[int, tuple[int, int, int, int]],
+        dict[int, float],
+        set[int],
+    ]:
+        """
+        Replace a single merged blob with cheap geometry-only pseudo-splits.
+
+        This avoids extra SAM calls. It only runs when the current frame has
+        fewer detections than tracked identities, so the normal fast path is
+        unchanged.
+        """
+        prev_ids = sorted(ref_state.masks.keys())
+        missing = max(0, len(prev_ids) - len(curr_sam_masks))
+        if missing <= 0 or len(curr_sam_masks) >= len(prev_ids):
+            return curr_sam_masks, curr_bboxes, curr_probs, set()
+
+        split_masks = dict(curr_sam_masks)
+        split_bboxes = dict(curr_bboxes)
+        split_probs = dict(curr_probs)
+        synthetic_sam_ids: set[int] = set()
+        claimed_mouse_ids: set[int] = set()
+        next_sam_id = -1
+
+        for sam_id, mask in sorted(
+            curr_sam_masks.items(),
+            key=lambda item: int(item[1].sum()),
+            reverse=True,
+        ):
+            if missing <= 0 or sam_id not in split_masks:
+                continue
+
+            candidate_mouse_ids = self._candidate_merge_mouse_ids(
+                mask,
+                ref_state,
+                claimed_mouse_ids,
+            )
+            target_parts = min(len(candidate_mouse_ids), missing + 1)
+            if target_parts < 2:
+                continue
+
+            candidate_mouse_ids = candidate_mouse_ids[:target_parts]
+            if not self._should_split_merged_mask(mask, candidate_mouse_ids, ref_state):
+                continue
+
+            pseudo_masks = self._split_mask_from_reference(
+                mask,
+                candidate_mouse_ids,
+                ref_state,
+            )
+            if len(pseudo_masks) != target_parts:
+                continue
+
+            logger.debug(
+                "Frame %d: split merged detection %d into %d pseudo-masks for mice %s",
+                frame_idx,
+                sam_id,
+                target_parts,
+                candidate_mouse_ids,
+            )
+
+            source_prob = split_probs.pop(sam_id, 1.0)
+            split_masks.pop(sam_id, None)
+            split_bboxes.pop(sam_id, None)
+            for pseudo_mask in pseudo_masks:
+                pseudo_id = next_sam_id
+                next_sam_id -= 1
+                split_masks[pseudo_id] = pseudo_mask
+                split_bboxes[pseudo_id] = _mask_bbox(pseudo_mask)
+                split_probs[pseudo_id] = source_prob
+                synthetic_sam_ids.add(pseudo_id)
+
+            claimed_mouse_ids.update(candidate_mouse_ids)
+            missing -= target_parts - 1
+
+        return split_masks, split_bboxes, split_probs, synthetic_sam_ids
+
+    def _candidate_merge_mouse_ids(
+        self,
+        mask: np.ndarray,
+        ref_state: TrackState,
+        claimed_mouse_ids: set[int],
+    ) -> list[int]:
+        """Find tracked identities that are plausibly inside a merged mask."""
+        if not np.any(mask):
+            return []
+
+        mask_centroid = _centroid(mask)
+        x1, y1, x2, y2 = _mask_bbox(mask)
+        bbox_diag = float(np.hypot(max(1, x2 - x1), max(1, y2 - y1)))
+        distance_limit = max(MERGE_BBOX_MARGIN_PX, 0.6 * bbox_diag)
+
+        candidates: list[tuple[int, int, float]] = []
+        for mouse_id in sorted(ref_state.masks.keys()):
+            if mouse_id in claimed_mouse_ids:
+                continue
+
+            prev_mask = self._reference_mask(ref_state, mouse_id)
+            prev_centroid = self._reference_centroid(ref_state, mouse_id)
+            overlap = 0
+            if prev_mask is not None and np.shape(prev_mask) == np.shape(mask):
+                overlap = int(np.logical_and(mask, prev_mask).sum())
+
+            inside = _point_in_bbox(prev_centroid, (x1, y1, x2, y2), MERGE_BBOX_MARGIN_PX)
+            distance = _euclidean(prev_centroid, mask_centroid)
+            if overlap <= 0 and not inside and distance > distance_limit:
+                continue
+
+            candidates.append((mouse_id, overlap, distance))
+
+        candidates.sort(key=lambda item: (-item[1], item[2], item[0]))
+        return [mouse_id for mouse_id, _, _ in candidates]
+
+    def _should_split_merged_mask(
+        self,
+        mask: np.ndarray,
+        mouse_ids: list[int],
+        ref_state: TrackState,
+    ) -> bool:
+        """Guard against over-splitting a normal single-animal mask."""
+        if len(mouse_ids) < 2:
+            return False
+
+        mask_area = int(mask.sum())
+        reference_areas = []
+        for mouse_id in mouse_ids:
+            ref_mask = self._reference_mask(ref_state, mouse_id)
+            if ref_mask is None:
+                continue
+            area = int(ref_mask.sum())
+            if area > 0:
+                reference_areas.append(area)
+
+        if len(reference_areas) < 2:
+            return False
+
+        largest_area = max(reference_areas)
+        combined_area = sum(reference_areas)
+        return (
+            mask_area >= int(largest_area * MERGE_AREA_RATIO_THRESHOLD)
+            or mask_area >= int(0.6 * combined_area)
+        )
+
+    def _split_mask_from_reference(
+        self,
+        mask: np.ndarray,
+        mouse_ids: list[int],
+        ref_state: TrackState,
+    ) -> list[np.ndarray]:
+        """Split a merged mask by nearest shifted reference centroid."""
+        if len(mouse_ids) < 2 or not np.any(mask):
+            return []
+
+        current_centroid = np.array(_centroid(mask), dtype=np.float32)
+        reference_centroids = np.array(
+            [self._reference_centroid(ref_state, mouse_id) for mouse_id in mouse_ids],
+            dtype=np.float32,
+        )
+        if reference_centroids.size == 0:
+            return []
+
+        shifted_centroids = reference_centroids.copy()
+        shifted_centroids += current_centroid - reference_centroids.mean(axis=0)
+
+        ys, xs = np.where(mask)
+        if len(xs) < len(mouse_ids):
+            return []
+
+        for idx in range(len(shifted_centroids)):
+            shifted_centroids[idx] = _snap_point_to_mask(
+                mask,
+                shifted_centroids[idx],
+            )
+
+        pixels = np.column_stack((xs, ys)).astype(np.float32)
+        distances = np.sum(
+            (pixels[:, None, :] - shifted_centroids[None, :, :]) ** 2,
+            axis=2,
+        )
+        labels = np.argmin(distances, axis=1)
+
+        min_piece_area = max(16, int(mask.sum() / max(8, len(mouse_ids) * 4)))
+        result: list[np.ndarray] = []
+        for label_idx in range(len(mouse_ids)):
+            submask = np.zeros(mask.shape, dtype=bool)
+            submask[ys, xs] = labels == label_idx
+            if int(submask.sum()) < min_piece_area:
+                return []
+            result.append(submask)
+
+        return result
+
     def _build_cost_matrix(
         self,
         prev_mouse_ids: list[int],
@@ -488,8 +754,8 @@ class IdentityTracker:
         w_app = self.weights.get("appearance", 0.25)
 
         for i, pmid in enumerate(prev_mouse_ids):
-            prev_mask = prev_state.masks.get(pmid)
-            prev_cent = prev_state.centroids.get(pmid, (0.0, 0.0))
+            prev_mask = self._reference_mask(prev_state, pmid)
+            prev_cent = self._reference_centroid(prev_state, pmid)
             prev_hist = self._appearance_histograms.get(pmid)
             if prev_mask is None:
                 C[i, :] = 1.0
@@ -523,6 +789,50 @@ class IdentityTracker:
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
+
+def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Return the tight bounding box of a boolean mask."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return (0, 0, 0, 0)
+    return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def _point_in_bbox(
+    point: tuple[float, float],
+    bbox: tuple[int, int, int, int],
+    margin: float = 0.0,
+) -> bool:
+    """Return True when a point falls inside a bounding box plus margin."""
+    x, y = point
+    x1, y1, x2, y2 = bbox
+    return (
+        x >= x1 - margin
+        and x <= x2 + margin
+        and y >= y1 - margin
+        and y <= y2 + margin
+    )
+
+
+def _snap_point_to_mask(mask: np.ndarray, point: np.ndarray) -> np.ndarray:
+    """Move a seed point onto the nearest foreground pixel if needed."""
+    x = int(round(float(point[0])))
+    y = int(round(float(point[1])))
+    h, w = mask.shape
+    x = min(max(x, 0), max(w - 1, 0))
+    y = min(max(y, 0), max(h - 1, 0))
+    if h > 0 and w > 0 and mask[y, x]:
+        return np.array([x, y], dtype=np.float32)
+
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return np.array([x, y], dtype=np.float32)
+
+    coords = np.column_stack((xs, ys)).astype(np.float32)
+    deltas = coords - np.array([x, y], dtype=np.float32)
+    nearest = coords[np.argmin(np.sum(deltas * deltas, axis=1))]
+    return nearest.astype(np.float32)
+
 
 def _centroid(mask: np.ndarray) -> tuple[float, float]:
     """Return (cx, cy) centroid of a boolean mask."""

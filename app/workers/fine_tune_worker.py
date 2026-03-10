@@ -62,6 +62,11 @@ class FineTuneWorker(QThread):
 
         try:
             self.status.emit(f"Launching SAM3 fine-tune: {Path(self.output_dir).name}")
+            self.log_line.emit("[MouseTracker] Launching local SAM3 fine-tuning job")
+            self.log_line.emit(f"[MouseTracker] Output directory: {self.output_dir}")
+            self.log_line.emit(
+                f"[MouseTracker] Detailed trainer log: {Path(self.output_dir) / 'logs' / 'log.txt'}"
+            )
             self._process = subprocess.Popen(
                 command,
                 cwd=str(ROOT_DIR),

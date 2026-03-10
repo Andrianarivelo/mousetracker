@@ -284,6 +284,14 @@ class SettingsPanel(QWidget):
         self.btn_free_track.clicked.connect(self.free_track_requested)
         action_inner.addWidget(self.btn_free_track)
 
+        self.chk_adaptive_reprompt = QCheckBox("Adaptive re-prompt")
+        self.chk_adaptive_reprompt.setChecked(False)
+        self.chk_adaptive_reprompt.setToolTip(
+            "Retry failed tracking frames with alternate text prompts.\n"
+            "Can recover some bad frames, but slows tracking down noticeably."
+        )
+        action_inner.addWidget(self.chk_adaptive_reprompt)
+
         # Skip + overlay options on one row
         skip_row = QHBoxLayout()
         skip_row.setSpacing(4)
@@ -475,6 +483,10 @@ class SettingsPanel(QWidget):
     def segment_size(self) -> int:
         """Frames per chunk/segment for long-video processing."""
         return self.spin_segment_size.value()
+
+    def adaptive_reprompt_enabled(self) -> bool:
+        """True when failed frames should be retried with alternate prompts."""
+        return self.chk_adaptive_reprompt.isChecked()
 
     def time_window_enabled(self) -> bool:
         return self.chk_time_window.isChecked()

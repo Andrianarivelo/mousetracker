@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 # 1500 frames ≈ 50 s @ 30 fps.  Adjust lower if you hit OOM.
 CHUNK_THRESHOLD = 1500
 CHUNK_SIZE = 1500
+MIN_CHUNK_SIZE = 100
+# Rough SAM3 session-memory estimate used to avoid obviously unsafe session sizes.
+ESTIMATED_SESSION_BYTES_PER_PIXEL = 32.0
+GPU_SESSION_HEADROOM = 0.55
+OOM_RETRY_CHUNK_SIZE = 250
 
 
 def _mask_dicts_equal(
@@ -89,6 +94,7 @@ class TrackingWorker(QThread):
         use_area_filter: bool = True,
         use_edge_filter: bool = True,
         bypass_filters: bool = False,
+        adaptive_reprompt: bool = False,
         # {frame_idx: {mouse_id: mask}} for multi-segment re-anchoring.
         # Must be sorted by frame_idx; frame 0 is the first keyframe.
         keyframes: Optional[list[tuple[int, dict[int, np.ndarray]]]] = None,
@@ -112,11 +118,13 @@ class TrackingWorker(QThread):
         self.use_area_filter = use_area_filter
         self.use_edge_filter = use_edge_filter
         self.bypass_filters = bypass_filters
+        self.adaptive_reprompt = adaptive_reprompt
         # Sorted list of (frame_idx, {mouse_id: mask}) — all user-annotated frames
         self.keyframes: list[tuple[int, dict[int, np.ndarray]]] = sorted(
             keyframes or [], key=lambda kv: kv[0]
         )
         self.chunk_size = max(100, chunk_size)
+        self._active_chunk_size = self.chunk_size
         self.size_validator = size_validator
         self._abort = False
         self._recovery_count = 0  # frames where recovery was triggered
@@ -142,17 +150,48 @@ class TrackingWorker(QThread):
             self.engine.load_model()
 
         remaining = max(1, self.frame_count - self.start_frame)
+        self._active_chunk_size = self._select_chunk_size(remaining)
 
         # Multi-segment mode: user has annotated ≥ 2 keyframes
         if len(self.keyframes) >= 2:
             self._run_multi_segment(remaining)
-        elif remaining > self.chunk_size:
-            self._run_chunked(remaining)
         else:
-            self._run_single_session(remaining)
+            use_chunked = self._should_use_chunked_tracking(remaining)
+            if use_chunked:
+                self.status.emit(
+                    f"Tracking in memory-safe chunks ({self._active_chunk_size} fr)…"
+                )
+                logger.info(
+                    "Using chunked tracking: start_frame=%d, frame_skip=%d, "
+                    "remaining=%d, chunk_size=%d",
+                    self.start_frame,
+                    self.frame_skip,
+                    remaining,
+                    self._active_chunk_size,
+                )
+                self._run_chunked(remaining)
+            else:
+                try:
+                    self._run_single_session(remaining)
+                except RuntimeError as error:
+                    if not self._is_cuda_oom(error):
+                        raise
+                    self._recover_from_cuda_oom()
+                    retry_chunk = self._select_oom_retry_chunk_size(remaining)
+                    if retry_chunk >= remaining:
+                        raise
+                    self._active_chunk_size = retry_chunk
+                    self.status.emit(
+                        f"CUDA memory pressure detected — retrying in smaller chunks ({retry_chunk} fr)…"
+                    )
+                    logger.warning(
+                        "Single-session tracking hit CUDA OOM; retrying with chunk size %d",
+                        retry_chunk,
+                    )
+                    self._run_chunked(remaining)
 
         # Adaptive re-prompting for frames that failed watershed/CC recovery
-        if self._failed_frames and not self._abort:
+        if self.adaptive_reprompt and self._failed_frames and not self._abort:
             self._adaptive_reprompt()
 
         if self._recovery_count or self._reprompt_count:
@@ -165,6 +204,87 @@ class TrackingWorker(QThread):
         self.finished.emit(True, "")
 
     # ── Multi-segment path (user keyframes) ───────────────────────────────────
+
+    def _estimate_safe_chunk_size(self) -> int:
+        """Estimate a GPU-safe chunk size for the current video geometry."""
+        h, w = self.frame_shape
+        bytes_per_chunk_frame = (
+            float(h) * float(w) * ESTIMATED_SESSION_BYTES_PER_PIXEL
+        ) / max(self.frame_skip, 1)
+        if bytes_per_chunk_frame <= 0:
+            return self.chunk_size
+
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return self.chunk_size
+
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            budget = min(
+                float(free_bytes) * GPU_SESSION_HEADROOM,
+                float(total_bytes) * 0.45,
+            )
+            safe_frames = int(budget / bytes_per_chunk_frame)
+            return max(MIN_CHUNK_SIZE, safe_frames)
+        except Exception as error:
+            logger.debug("Chunk-size auto estimate unavailable: %s", error)
+            return self.chunk_size
+
+    def _select_chunk_size(self, remaining: int) -> int:
+        """Apply the user's segment size as an upper bound on the safe chunk size."""
+        auto_chunk = self._estimate_safe_chunk_size()
+        chosen = min(self.chunk_size, auto_chunk)
+        if chosen < self.chunk_size:
+            logger.info(
+                "Auto-limiting chunk size from %d to %d based on GPU memory",
+                self.chunk_size,
+                chosen,
+            )
+        return max(MIN_CHUNK_SIZE, min(chosen, max(remaining, 1)))
+
+    def _should_use_chunked_tracking(self, remaining: int) -> bool:
+        """
+        Use chunked tracking whenever a full-video session is likely unsafe.
+
+        Single-session mode ignores frame skipping and still loads the entire
+        source video into SAM3, so it is only safe for genuinely small runs.
+        """
+        return (
+            self.start_frame > 0
+            or self.frame_skip > 1
+            or remaining > self._active_chunk_size
+        )
+
+    def _is_cuda_oom(self, error: Exception) -> bool:
+        text = str(error).lower()
+        return "out of memory" in text or "cuda oom" in text
+
+    def _recover_from_cuda_oom(self) -> None:
+        """Release any half-open session state before retrying."""
+        try:
+            self.engine.close_session()
+        except Exception:
+            pass
+
+        try:
+            import gc
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _select_oom_retry_chunk_size(self, remaining: int) -> int:
+        """Pick a smaller chunk size for an automatic OOM retry."""
+        retry_chunk = min(self._active_chunk_size, OOM_RETRY_CHUNK_SIZE)
+        if retry_chunk >= remaining:
+            retry_chunk = max(MIN_CHUNK_SIZE, remaining // 2)
+        if retry_chunk >= remaining:
+            retry_chunk = max(MIN_CHUNK_SIZE, remaining - 1)
+        return retry_chunk
 
     def _run_multi_segment(self, remaining: int) -> None:
         """
@@ -226,7 +346,7 @@ class TrackingWorker(QThread):
             if not self._abort:
                 self.chunk_complete.emit(last_abs_frame)
                 # Between segments: re-prompt any failed frames from this segment
-                if self._failed_frames:
+                if self.adaptive_reprompt and self._failed_frames:
                     self._adaptive_reprompt()
 
         # Handle tail beyond last keyframe (extend the final segment to end of video)
@@ -265,30 +385,34 @@ class TrackingWorker(QThread):
 
     def _run_single_session(self, remaining: int) -> None:
         self.status.emit("Loading video into SAM3 — please wait…")
-        self.engine.start_session(self.video_path)
+        try:
+            self.engine.start_session(self.video_path)
 
-        # Seed from initial masks (from the user's prompt/assignment step).
-        # Without this, SAM3 has no prompts and propagation produces nothing.
-        if self.initial_masks:
-            self.engine._ensure_cached_frame_outputs(all_frames=True)
-            for obj_id, mask in self.initial_masks.items():
-                self.engine.add_mask_prompt(
-                    self.start_frame, mask, obj_id, self.frame_shape,
-                )
-            self.status.emit("Seeded SAM3 — propagating…")
+            # Seed from initial masks (from the user's prompt/assignment step).
+            # Without this, SAM3 has no prompts and propagation produces nothing.
+            if self.initial_masks:
+                self.engine._ensure_cached_frame_outputs(all_frames=True)
+                for obj_id, mask in self.initial_masks.items():
+                    self.engine.add_mask_prompt(
+                        self.start_frame, mask, obj_id, self.frame_shape,
+                    )
+                self.status.emit("Seeded SAM3 — propagating…")
 
-        frames_done = 0
-        t_start = time.time()
+            frames_done = 0
+            t_start = time.time()
 
-        for result in self.engine.propagate(
-            direction="forward",
-            start_frame=self.start_frame,
-        ):
-            if self._abort:
-                break
-            frames_done = self._process_result(result, frames_done, remaining, t_start)
+            for result in self.engine.propagate(
+                direction="forward",
+                start_frame=self.start_frame,
+            ):
+                if self._abort:
+                    break
+                frames_done = self._process_result(result, frames_done, remaining, t_start)
 
-        logger.info(f"Single-session tracking complete: {frames_done} frames")
+            logger.info(f"Single-session tracking complete: {frames_done} frames")
+        finally:
+            if self.engine.session_id is not None:
+                self.engine.close_session()
 
     # ── Chunked path (long videos, no keyframes) ───────────────────────────────
 
@@ -317,7 +441,7 @@ class TrackingWorker(QThread):
             frame_count=self.frame_count,
             frame_shape=self.frame_shape,
             initial_masks=self.initial_masks,
-            chunk_frames=self.chunk_size,
+            chunk_frames=self._active_chunk_size,
             start_frame=self.start_frame,
             chunk_status_callback=chunk_cb,
             frame_skip=self.frame_skip,
@@ -497,7 +621,8 @@ class TrackingWorker(QThread):
                     state = self.tracker.replace_masks(frame_idx, corrected)
                 else:
                     # Watershed/CC failed — queue for adaptive re-prompting
-                    self._failed_frames.append(frame_idx)
+                    if self.adaptive_reprompt:
+                        self._failed_frames.append(frame_idx)
 
         frames_done += 1
 

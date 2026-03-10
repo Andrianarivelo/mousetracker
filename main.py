@@ -1,8 +1,12 @@
 """MouseTracker Pro — entry point."""
 
 import logging
+import os
 import sys
 from pathlib import Path
+
+# Reduce CUDA allocator fragmentation before torch is imported anywhere.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 # Add the mousetracker package root to path so that `app.*` imports work
 sys.path.insert(0, str(Path(__file__).parent))

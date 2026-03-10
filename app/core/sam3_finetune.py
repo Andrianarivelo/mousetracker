@@ -165,6 +165,7 @@ def _build_training_config(dataset_info: dict, params: Sam3FineTuneParams) -> di
     accelerator = "cuda" if available_gpu_count() > 0 else "cpu"
     backend = default_distributed_backend()
     amp_dtype = default_amp_dtype(accelerator)
+    enable_distributed_sampler = params.num_gpus > 1
     checkpoint_path = params.checkpoint_path or None
     bpe_path = params.bpe_path or default_bpe_path()
 
@@ -190,6 +191,7 @@ def _build_training_config(dataset_info: dict, params: Sam3FineTuneParams) -> di
         "pin_memory": accelerator == "cuda",
         "drop_last": True,
         "collate_fn": "${scratch.collate_fn}",
+        "enable_distributed_sampler": enable_distributed_sampler,
     }
 
     val_dataset = None
@@ -218,6 +220,7 @@ def _build_training_config(dataset_info: dict, params: Sam3FineTuneParams) -> di
             "pin_memory": accelerator == "cuda",
             "drop_last": False,
             "collate_fn": "${scratch.collate_fn_val}",
+            "enable_distributed_sampler": enable_distributed_sampler,
         }
 
     return {

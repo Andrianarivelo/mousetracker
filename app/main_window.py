@@ -1,6 +1,7 @@
 """MainWindow with docked layout for MouseTracker Pro."""
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -10,11 +11,15 @@ from PySide6.QtGui import QImage, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
+    QDialog,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
     QStatusBar,
     QTextEdit,
     QVBoxLayout,
@@ -82,6 +87,10 @@ from app.workers.tracking_worker import TrackingWorker
 
 logger = logging.getLogger(__name__)
 
+_FINE_TUNE_DATASET_RE = re.compile(r"Raw dataset length\s*=\s*(\d+)")
+_FINE_TUNE_PROGRESS_RE = re.compile(r"(Train|Val) Epoch: \[(\d+)\]\[(\d+)/(\d+)\]")
+_FINE_TUNE_REMAINING_RE = re.compile(r"Estimated time remaining:\s*(.+)")
+
 
 class MainWindow(QMainWindow):
     """
@@ -118,6 +127,11 @@ class MainWindow(QMainWindow):
         self._export_worker: Optional[ExportWorker] = None
         self._preprocess_worker: Optional[PreprocessingWorker] = None
         self._fine_tune_worker: Optional[FineTuneWorker] = None
+        self._fine_tune_log_dialog: Optional[QDialog] = None
+        self._fine_tune_log_view: Optional[QPlainTextEdit] = None
+        self._fine_tune_log_status: Optional[QLabel] = None
+        self._fine_tune_log_path: Optional[QLabel] = None
+        self._fine_tune_output_dir: str = ""
 
         # Pending SAM3 prompt outputs (for interactive setup)
         self._pending_outputs: Optional[dict] = None   # raw SAM3 outputs on prompted frame
@@ -1806,6 +1820,7 @@ class MainWindow(QMainWindow):
             use_area_filter=self.settings_panel.area_filter_enabled(),
             use_edge_filter=self.settings_panel.edge_filter_enabled(),
             bypass_filters=self.settings_panel.raw_sam_enabled(),
+            adaptive_reprompt=self.settings_panel.adaptive_reprompt_enabled(),
             keyframes=keyframes if len(keyframes) >= 2 else None,
             chunk_size=self.settings_panel.segment_size(),
             size_validator=self._size_validator if self._size_validator.any_reference() else None,
@@ -2571,7 +2586,9 @@ class MainWindow(QMainWindow):
             output_dir=job["output_dir"],
             parent=self,
         )
+        self._prepare_fine_tune_log_view(job["output_dir"], job["config_path"])
         self._fine_tune_worker.status.connect(self._on_fine_tune_status)
+        self._fine_tune_worker.log_line.connect(self._on_fine_tune_log_line)
         self._fine_tune_worker.finished.connect(self._on_fine_tune_finished)
         self._fine_tune_worker.start()
 
@@ -2579,8 +2596,20 @@ class MainWindow(QMainWindow):
         message = str(text).strip()
         if not message:
             return
-        self.progress_widget.set_indeterminate(message)
-        self.lbl_status.setText(message)
+        summary = self._summarize_fine_tune_message(message)
+        self.progress_widget.set_indeterminate(summary)
+        self.lbl_status.setText(summary)
+        if self._fine_tune_log_status is not None:
+            self._fine_tune_log_status.setText(summary)
+
+    def _on_fine_tune_log_line(self, text: str) -> None:
+        line = str(text).rstrip()
+        if not line:
+            return
+        if self._fine_tune_log_view is None:
+            self._ensure_fine_tune_log_dialog()
+        if self._fine_tune_log_view is not None:
+            self._fine_tune_log_view.appendPlainText(line)
 
     def _on_fine_tune_finished(self, success: bool, result: str) -> None:
         self.progress_widget.set_determinate()
@@ -2589,6 +2618,10 @@ class MainWindow(QMainWindow):
             self.progress_widget.update_progress(100, status)
             self.examples_panel.set_dataset_status(status)
             self.lbl_status.setText(status)
+            if self._fine_tune_log_status is not None:
+                self._fine_tune_log_status.setText(status)
+            if self._fine_tune_log_view is not None:
+                self._fine_tune_log_view.appendPlainText("[MouseTracker] Training completed successfully.")
             QMessageBox.information(
                 self,
                 "Fine-Tune SAM3",
@@ -2597,8 +2630,124 @@ class MainWindow(QMainWindow):
         else:
             self.progress_widget.reset("Fine-tune failed")
             self.lbl_status.setText("SAM3 fine-tune failed")
+            if self._fine_tune_log_status is not None:
+                self._fine_tune_log_status.setText("SAM3 fine-tune failed")
+            if self._fine_tune_log_view is not None:
+                self._fine_tune_log_view.appendPlainText("[MouseTracker] Training failed.")
             QMessageBox.critical(self, "Fine-Tune SAM3", result)
         self._fine_tune_worker = None
+
+    def _ensure_fine_tune_log_dialog(self) -> None:
+        if self._fine_tune_log_dialog is not None:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("SAM3 Fine-Tune Progress")
+        dlg.resize(880, 560)
+        layout = QVBoxLayout(dlg)
+
+        self._fine_tune_log_status = QLabel("Preparing SAM3 fine-tune...")
+        self._fine_tune_log_status.setWordWrap(True)
+        layout.addWidget(self._fine_tune_log_status)
+
+        self._fine_tune_log_path = QLabel("")
+        self._fine_tune_log_path.setWordWrap(True)
+        layout.addWidget(self._fine_tune_log_path)
+
+        self._fine_tune_log_view = QPlainTextEdit(dlg)
+        self._fine_tune_log_view.setReadOnly(True)
+        self._fine_tune_log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._fine_tune_log_view.setMaximumBlockCount(5000)
+        layout.addWidget(self._fine_tune_log_view, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+
+        btn_copy = QPushButton("Copy Log")
+        btn_copy.setObjectName("secondary_button")
+        btn_copy.clicked.connect(self._copy_fine_tune_log)
+        button_row.addWidget(btn_copy)
+
+        btn_hide = QPushButton("Hide")
+        btn_hide.setObjectName("secondary_button")
+        btn_hide.clicked.connect(dlg.hide)
+        button_row.addWidget(btn_hide)
+
+        layout.addLayout(button_row)
+        self._fine_tune_log_dialog = dlg
+
+    def _prepare_fine_tune_log_view(self, output_dir: str, config_path: str) -> None:
+        self._fine_tune_output_dir = output_dir
+        self._ensure_fine_tune_log_dialog()
+        if self._fine_tune_log_view is None:
+            return
+
+        self._fine_tune_log_view.clear()
+        if self._fine_tune_log_status is not None:
+            self._fine_tune_log_status.setText("Launching SAM3 fine-tune...")
+        if self._fine_tune_log_path is not None:
+            log_path = Path(output_dir) / "logs" / "log.txt"
+            self._fine_tune_log_path.setText(
+                f"Output: {output_dir}\n"
+                f"Config: {config_path}\n"
+                f"Detailed trainer log: {log_path}"
+            )
+
+        self._fine_tune_log_view.appendPlainText("[MouseTracker] Live SAM3 fine-tune log")
+        self._fine_tune_log_view.appendPlainText(
+            "[MouseTracker] Progress guide: "
+            "'Raw dataset length = N' means N training samples were loaded."
+        )
+        self._fine_tune_log_view.appendPlainText(
+            "[MouseTracker] Progress guide: "
+            "'Train Epoch: [e][i/n]' means epoch e+1, batch i+1 of n."
+        )
+        self._fine_tune_log_view.appendPlainText("")
+
+        if self._fine_tune_log_dialog is not None:
+            self._fine_tune_log_dialog.show()
+            self._fine_tune_log_dialog.raise_()
+            self._fine_tune_log_dialog.activateWindow()
+
+    def _copy_fine_tune_log(self) -> None:
+        if self._fine_tune_log_view is None:
+            return
+        QApplication.clipboard().setText(self._fine_tune_log_view.toPlainText())
+
+    def _summarize_fine_tune_message(self, message: str) -> str:
+        dataset_match = _FINE_TUNE_DATASET_RE.search(message)
+        if dataset_match:
+            return f"Loaded training dataset: {dataset_match.group(1)} samples"
+
+        progress_match = _FINE_TUNE_PROGRESS_RE.search(message)
+        if progress_match:
+            phase, epoch, batch_idx, batch_total = progress_match.groups()
+            current_batch = min(int(batch_idx) + 1, int(batch_total))
+            prefix = "Training" if phase == "Train" else "Validation"
+            return (
+                f"{prefix} epoch {int(epoch) + 1} | "
+                f"batch {current_batch}/{batch_total}"
+            )
+
+        remaining_match = _FINE_TUNE_REMAINING_RE.search(message)
+        if remaining_match:
+            return f"Estimated time remaining: {remaining_match.group(1)}"
+
+        if "Setting up components:" in message:
+            return "Initializing model, optimizer, and training components..."
+        if "Finished setting up components:" in message:
+            return "Trainer setup complete. Starting training..."
+        if "Moving components to device" in message:
+            return "Moving SAM3 model to the selected device..."
+        if "TensorBoard SummaryWriter instantiated." in message:
+            return "TensorBoard logging is ready."
+        if "Experiment Log Dir:" in message:
+            return "Preparing log and checkpoint directories..."
+        if "Losses and meters:" in message:
+            return "Completed a training epoch. Updating metrics..."
+        if "Meters:" in message:
+            return "Completed validation. Updating metrics..."
+        return message
 
     def _get_entity_class_names(self) -> dict[int, str]:
         """Return {mouse_id: name} from the identity panel entities."""
