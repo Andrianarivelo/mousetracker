@@ -30,14 +30,35 @@ def _patch_sam3_single_gpu_windows() -> None:
     original_barrier = trainer_module.dist.barrier
     original_is_dist_ready = trainer_module.is_dist_avail_and_initialized
     original_torchdataset_init = torch_dataset_module.TorchDataset.__init__
+    original_all_reduce = torch.distributed.all_reduce
+    original_get_world_size = torch.distributed.get_world_size
+    original_get_rank = torch.distributed.get_rank
 
     def _is_single_process_run() -> bool:
         return int(os.environ.get("WORLD_SIZE", "1")) <= 1
 
+    def _dist_is_ready() -> bool:
+        return torch.distributed.is_available() and torch.distributed.is_initialized()
+
     def _safe_barrier(*args, **kwargs):
-        if trainer_module.dist.is_available() and trainer_module.dist.is_initialized():
+        if _dist_is_ready():
             return original_barrier(*args, **kwargs)
         return None
+
+    def _safe_all_reduce(*args, **kwargs):
+        if _is_single_process_run() and not _dist_is_ready():
+            return None
+        return original_all_reduce(*args, **kwargs)
+
+    def _safe_get_world_size(*args, **kwargs):
+        if _is_single_process_run() and not _dist_is_ready():
+            return 1
+        return original_get_world_size(*args, **kwargs)
+
+    def _safe_get_rank(*args, **kwargs):
+        if _is_single_process_run() and not _dist_is_ready():
+            return 0
+        return original_get_rank(*args, **kwargs)
 
     def _is_dist_ready_for_trainer() -> bool:
         if _is_single_process_run():
@@ -96,6 +117,9 @@ def _patch_sam3_single_gpu_windows() -> None:
             kwargs["enable_distributed_sampler"] = False
         original_torchdataset_init(self, *args, **kwargs)
 
+    torch.distributed.all_reduce = _safe_all_reduce
+    torch.distributed.get_world_size = _safe_get_world_size
+    torch.distributed.get_rank = _safe_get_rank
     torch_dataset_module.TorchDataset.__init__ = _torchdataset_init
     trainer_module.dist.barrier = _safe_barrier
     trainer_module.is_dist_avail_and_initialized = _is_dist_ready_for_trainer
