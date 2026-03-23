@@ -205,17 +205,6 @@ def draw_entity_labels(
         conf = confidences.get(mouse_id, 0.0)
         label = f"{name}  {conf:.0%}"
         x, y = int(cx), int(cy)
-        if active_entity_id == mouse_id:
-            (text_w, text_h), baseline = cv2.getTextSize(
-                label,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                1,
-            )
-            top_left = (x - 6, y - text_h - 8)
-            bottom_right = (x + text_w + 6, y + baseline + 6)
-            cv2.rectangle(out, top_left, bottom_right, (0, 0, 0), -1)
-            cv2.rectangle(out, top_left, bottom_right, bgr, 2)
         # Shadow (black, thick)
         cv2.putText(out, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0, 0, 0), 3, cv2.LINE_AA)

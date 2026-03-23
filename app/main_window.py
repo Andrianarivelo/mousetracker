@@ -148,6 +148,11 @@ class MainWindow(QMainWindow):
         self._split_polygon_points: list[tuple[int, int]] = []
         self._split_polygon_freehand: bool = False
         self._split_polygon_temporary: bool = False
+        self._entity_lasso_active: bool = False
+        self._entity_lasso_frame_idx: Optional[int] = None
+        self._entity_lasso_mouse_id: Optional[int] = None
+        self._entity_lasso_points: list[tuple[int, int]] = []
+        self._entity_lasso_add_mode: bool = False
         self._show_keypoints: bool = False
         # Mutable key→entity mapping (can be customized from settings)
         self._entity_keys: dict[int, int] = dict(_DEFAULT_DIGIT_KEYS)
@@ -398,6 +403,11 @@ class MainWindow(QMainWindow):
             self._segmentation_examples.clear()
             self._sam3_undo_by_frame.clear()
             self._sam3_redo_by_frame.clear()
+            self._entity_lasso_active = False
+            self._entity_lasso_frame_idx = None
+            self._entity_lasso_mouse_id = None
+            self._entity_lasso_points.clear()
+            self._entity_lasso_add_mode = False
             self.examples_panel.clear_examples()
             self.progress_widget.reset()
 
@@ -434,6 +444,11 @@ class MainWindow(QMainWindow):
                 "Split mode cancelled after changing frame.",
                 rerender=False,
             )
+        if self._entity_lasso_active and frame_idx != self._entity_lasso_frame_idx:
+            self._cancel_entity_lasso_mode(
+                "Region refine cancelled after changing frame.",
+                rerender=False,
+            )
         self._current_frame_idx = frame_idx
         self.identity_panel.set_current_frame(frame_idx)
         self._render_frame(frame_idx)
@@ -467,6 +482,8 @@ class MainWindow(QMainWindow):
 
         if self._split_polygon_active and frame_idx == self._split_polygon_frame_idx:
             composite = self._draw_split_polygon_overlay(composite)
+        if self._entity_lasso_active and frame_idx == self._entity_lasso_frame_idx:
+            composite = self._draw_entity_lasso_overlay(composite)
 
         # ROI overlay
         if self._roi_analyzer.rois:
@@ -491,7 +508,14 @@ class MainWindow(QMainWindow):
                     for eid in state.centroids
                 }
                 active_entity_id = None
-                if frame_idx == self._prompt_frame_idx and self._pending_outputs is not None:
+                if (
+                    frame_idx == self._prompt_frame_idx
+                    and self._pending_outputs is not None
+                    and not (
+                        self._entity_lasso_active
+                        and frame_idx == self._entity_lasso_frame_idx
+                    )
+                ):
                     active_entity_id = self.identity_panel.selected_mouse()
                 composite = draw_entity_labels(
                     composite, state.centroids, state.confidences,
@@ -579,6 +603,7 @@ class MainWindow(QMainWindow):
         """Show crosshair on the viewer when click-to-assign is active."""
         active = (
             not self._split_polygon_active
+            and not self._entity_lasso_active
             and
             self._pending_outputs is not None
             and self._current_frame_idx == self._prompt_frame_idx
@@ -586,12 +611,346 @@ class MainWindow(QMainWindow):
         )
         self.viewer.set_assignment_cursor(active)
 
+    def _start_entity_lasso_mode(self, mouse_id: int) -> None:
+        if self._split_polygon_active:
+            self._cancel_split_polygon_mode(rerender=False)
+        self._entity_lasso_active = True
+        self._entity_lasso_frame_idx = self._current_frame_idx
+        self._entity_lasso_mouse_id = int(mouse_id)
+        self._entity_lasso_points.clear()
+        self._update_assignment_cursor()
+        self._render_frame(self._current_frame_idx)
+        name = self.identity_panel.entity_name(int(mouse_id))
+        mode = "add" if self._entity_lasso_add_mode else "detect"
+        self.lbl_status.setText(
+            f"Region {mode}: hold Ctrl and drag around {name}, release to apply."
+        )
+
+    def _cancel_entity_lasso_mode(
+        self,
+        status: Optional[str] = None,
+        rerender: bool = True,
+    ) -> None:
+        was_active = self._entity_lasso_active or bool(self._entity_lasso_points)
+        self._entity_lasso_active = False
+        self._entity_lasso_frame_idx = None
+        self._entity_lasso_mouse_id = None
+        self._entity_lasso_points.clear()
+        self._entity_lasso_add_mode = False
+        self._update_assignment_cursor()
+        if rerender and was_active and self._video_reader is not None:
+            self._render_frame(self._current_frame_idx)
+        if status:
+            self.lbl_status.setText(status)
+
+    def _append_entity_lasso_point(
+        self,
+        x: int,
+        y: int,
+        *,
+        min_distance: int = 0,
+    ) -> bool:
+        point = (int(x), int(y))
+        if not self._entity_lasso_points:
+            self._entity_lasso_points.append(point)
+            return True
+
+        last_x, last_y = self._entity_lasso_points[-1]
+        if min_distance > 0:
+            dx = point[0] - last_x
+            dy = point[1] - last_y
+            if (dx * dx) + (dy * dy) < (min_distance * min_distance):
+                return False
+        elif point == self._entity_lasso_points[-1]:
+            return False
+
+        self._entity_lasso_points.append(point)
+        return True
+
+    def _can_begin_entity_lasso_refine(self) -> bool:
+        if self._video_reader is None:
+            return False
+        if not self._video_path:
+            return False
+        return self.identity_panel.selected_mouse() is not None
+
+    def _draw_entity_lasso_overlay(self, frame: np.ndarray) -> np.ndarray:
+        import cv2
+
+        if (
+            not self._entity_lasso_active
+            or self._entity_lasso_frame_idx != self._current_frame_idx
+        ):
+            return frame
+
+        out = frame.copy()
+        points = np.array(self._entity_lasso_points, dtype=np.int32)
+        accent = (120, 220, 120)
+
+        if len(points) >= 3:
+            overlay = out.copy()
+            cv2.fillPoly(overlay, [points], accent)
+            cv2.addWeighted(overlay, 0.16, out, 0.84, 0, out)
+
+        if len(points) >= 2:
+            cv2.polylines(out, [points], isClosed=False, color=accent, thickness=2)
+
+        if len(self._entity_lasso_points) > 0:
+            x, y = self._entity_lasso_points[-1]
+            cv2.circle(out, (int(x), int(y)), 4, accent, -1)
+            cv2.circle(out, (int(x), int(y)), 6, (12, 24, 12), 1)
+
+        entity_name = ""
+        if self._entity_lasso_mouse_id is not None:
+            entity_name = self.identity_panel.entity_name(self._entity_lasso_mouse_id)
+        mode_badge = "+ADD " if self._entity_lasso_add_mode else ""
+        badge = f"{mode_badge}REFINE {entity_name}  Ctrl+drag region  release to apply".strip()
+        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        cv2.rectangle(out, (8, 30), (18 + tw, 40 + th), (10, 22, 10), -1)
+        cv2.putText(
+            out,
+            badge,
+            (14, 36 + th),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            accent,
+            1,
+            cv2.LINE_AA,
+        )
+        return out
+
+    def _apply_entity_lasso_refine(self) -> None:
+        import cv2
+
+        if (
+            not self._entity_lasso_active
+            or self._entity_lasso_frame_idx != self._current_frame_idx
+            or self._video_reader is None
+        ):
+            self._cancel_entity_lasso_mode()
+            return
+
+        mouse_id = self._entity_lasso_mouse_id
+        if mouse_id is None:
+            self._cancel_entity_lasso_mode("Select an entity first.")
+            return
+
+        if len(self._entity_lasso_points) < 3:
+            self._cancel_entity_lasso_mode(
+                "Region refine cancelled. Hold Ctrl and drag a larger outline."
+            )
+            return
+
+        frame_idx = self._current_frame_idx
+        info = self._video_reader.info
+        frame_shape = (info.height, info.width)
+        polygon = np.array(self._entity_lasso_points, dtype=np.int32)
+        region_mask = np.zeros(frame_shape, dtype=np.uint8)
+        cv2.fillPoly(region_mask, [polygon], 1)
+        region_mask = region_mask.astype(bool)
+        if int(region_mask.sum()) < 20:
+            self._cancel_entity_lasso_mode(
+                "Region refine cancelled. Draw a larger region."
+            )
+            return
+
+        previous_outputs = (
+            self._pending_outputs
+            if self._prompt_frame_idx == frame_idx and self._pending_outputs is not None
+            else None
+        )
+        if previous_outputs is None:
+            example_entry = self._segmentation_examples.get(frame_idx)
+            if example_entry is not None and "outputs" in example_entry:
+                previous_outputs = self._clone_outputs(example_entry.get("outputs"))
+
+        current_masks: dict[int, np.ndarray] = {}
+        if previous_outputs is not None:
+            current_masks, _ = self._to_filtered_masks(previous_outputs, frame_shape)
+
+        try:
+            if not self._engine.is_loaded():
+                self.progress_widget.set_indeterminate("Loading SAM3 model…")
+                self._engine.load_model()
+
+            need_new_session = (
+                self._engine.session_id is None
+                or self._prompt_frame_idx != frame_idx
+            )
+            if need_new_session:
+                self._engine.start_session_on_frame(self._video_path, frame_idx)
+                self._prompt_frame_idx = frame_idx
+                self._prompt_points.clear()
+
+                # Re-seed existing masks so region refinement keeps context.
+                for sid, mask in current_masks.items():
+                    self._engine.add_mask_prompt(
+                        0,
+                        mask,
+                        int(sid),
+                        frame_shape=frame_shape,
+                    )
+            self.progress_widget.set_determinate()
+        except Exception as error:
+            self.progress_widget.set_determinate()
+            self.progress_widget.reset("Region refine failed")
+            self._cancel_entity_lasso_mode()
+            QMessageBox.critical(self, "Segmentation Error", str(error))
+            logger.exception("Region refine setup failed: %s", error)
+            return
+
+        obj_hint = self._identity_mgr.sam_id_for_mouse(mouse_id)
+        if obj_hint is None and current_masks:
+            best_sid = None
+            best_overlap = 0
+            for sid, mask in current_masks.items():
+                overlap = int(np.logical_and(mask, region_mask).sum())
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_sid = int(sid)
+            if best_sid is not None and best_overlap > 0:
+                obj_hint = best_sid
+
+        # SAM3 in this environment requires obj_id for prompt refinement.
+        # If the selected entity has no SAM object yet, create a new ID.
+        if obj_hint is None:
+            obj_hint = self._next_available_sam_id(current_masks)
+
+        obj_hint = int(obj_hint)
+        self._identity_mgr.assign(mouse_id, obj_hint)
+        self.identity_panel.mark_assigned(mouse_id, obj_hint)
+
+        self._push_sam3_undo(f"region refine entity {mouse_id}", frame_idx=frame_idx)
+
+        add_mode = bool(self._entity_lasso_add_mode)
+        base_mask = current_masks.get(obj_hint)
+        points, point_labels = self._sample_region_prompt_points(
+            region_mask,
+            positive_count=3 if add_mode else 1,
+            negative_count=3 if add_mode else 8,
+        )
+        if not points:
+            self._cancel_entity_lasso_mode(
+                "No valid prompt points in the selected region.",
+            )
+            return
+        raw_outputs = self._engine.add_point_prompt(
+            0,
+            points,
+            point_labels,
+            obj_id=obj_hint,
+            frame_shape=frame_shape,
+        )
+
+        # Keep only one detected object from the selected region for this mouse.
+        sam_masks_raw = self._engine.outputs_to_masks(raw_outputs, frame_shape)
+        best_sid: Optional[int] = None
+        best_score = -1.0
+        best_overlap = 0
+        region_area = max(1, int(region_mask.sum()))
+        if obj_hint in sam_masks_raw:
+            hinted_mask = sam_masks_raw[int(obj_hint)]
+            hinted_overlap = int(np.logical_and(hinted_mask, region_mask).sum())
+            if hinted_overlap > 0:
+                hinted_area = max(1, int(hinted_mask.sum()))
+                best_sid = int(obj_hint)
+                best_overlap = hinted_overlap
+                best_score = (hinted_overlap / hinted_area) + (hinted_overlap / region_area)
+        for sid, mask in sam_masks_raw.items():
+            overlap = int(np.logical_and(mask, region_mask).sum())
+            if overlap <= 0:
+                continue
+            area = max(1, int(mask.sum()))
+            score = (overlap / area) + (overlap / region_area)
+            if score > best_score:
+                best_score = score
+                best_overlap = overlap
+                best_sid = int(sid)
+        if best_sid is None:
+            if obj_hint in sam_masks_raw:
+                best_sid = int(obj_hint)
+            else:
+                self._cancel_entity_lasso_mode(
+                    "No mouse detected inside the selected region.",
+                )
+                return
+
+        selected_mask = sam_masks_raw.get(best_sid)
+        if selected_mask is None:
+            self._cancel_entity_lasso_mode(
+                "No mouse detected inside the selected region.",
+            )
+            return
+        selected_mask = np.logical_and(selected_mask.astype(bool), region_mask)
+        if selected_mask.any():
+            comp_count, comp_labels, comp_stats, _ = cv2.connectedComponentsWithStats(
+                selected_mask.astype(np.uint8),
+                connectivity=8,
+            )
+            if comp_count > 2:
+                largest_idx = 1 + int(np.argmax(comp_stats[1:, cv2.CC_STAT_AREA]))
+                selected_mask = comp_labels == largest_idx
+        if int(selected_mask.sum()) < 20:
+            self._cancel_entity_lasso_mode(
+                "No clear mouse mask found in that region. Draw tighter around one animal.",
+            )
+            return
+        if add_mode and base_mask is not None:
+            selected_mask = np.logical_or(base_mask.astype(bool), selected_mask.astype(bool))
+
+        target_sid = int(obj_hint)
+        self._identity_mgr.assign(mouse_id, target_sid)
+        self.identity_panel.mark_assigned(mouse_id, target_sid)
+        self._size_validator.record(mouse_id, selected_mask)
+
+        mapping = self._identity_mgr.get_full_mapping()
+        stable_sid_masks: dict[int, np.ndarray] = {target_sid: selected_mask}
+        for mid, sid in mapping.items():
+            sid = int(sid)
+            if mid == mouse_id or sid == target_sid:
+                continue
+            prev_mask = current_masks.get(sid)
+            if prev_mask is not None:
+                stable_sid_masks[sid] = prev_mask
+
+        self._pending_outputs = self._outputs_from_masks(stable_sid_masks)
+        self._prompt_frame_idx = frame_idx
+        sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        if target_sid not in sam_masks:
+            sam_masks[target_sid] = selected_mask
+        # Hide leftover reflection overlays for region-refine mode.
+        self._rejected_masks = {}
+
+        display_masks: dict[int, np.ndarray] = {}
+        for mid, sid in mapping.items():
+            sid = int(sid)
+            if sid in sam_masks:
+                display_masks[mid] = sam_masks[sid]
+        if not display_masks:
+            display_masks = {int(mouse_id): selected_mask}
+        self._all_masks[frame_idx] = display_masks
+
+        if mapping and sam_masks:
+            self._tracker.initialize(frame_idx, sam_masks, mapping)
+
+        prompt = self.action_bar.text_prompt()
+        obj_count = len(self._pending_outputs.get("out_obj_ids", []))
+        self._record_segmentation_example(frame_idx, prompt, obj_count, self._pending_outputs)
+        self._refresh_prompt_assignment_ui(frame_idx, sam_masks)
+
+        entity_name = self.identity_panel.entity_name(mouse_id)
+        self._cancel_entity_lasso_mode(
+            f"Auto-detected {entity_name} in selected region ({int(region_mask.sum())} px).",
+        )
+
     def _start_split_polygon_mode(
         self,
         *,
         freehand: bool = False,
         temporary: bool = False,
     ) -> None:
+        if self._entity_lasso_active:
+            self._cancel_entity_lasso_mode(rerender=False)
         self._split_polygon_active = True
         self._split_polygon_frame_idx = self._current_frame_idx
         self._split_polygon_points.clear()
@@ -730,6 +1089,74 @@ class MainWindow(QMainWindow):
     def _mask_centroid_x(mask: np.ndarray) -> float:
         ys, xs = np.where(mask)
         return float(xs.mean()) if len(xs) > 0 else 0.0
+
+    def _next_available_sam_id(
+        self,
+        masks: Optional[dict[int, np.ndarray]] = None,
+    ) -> int:
+        used_ids: set[int] = set(
+            int(sid) for sid in self._identity_mgr.get_full_mapping().values()
+        )
+        if masks:
+            used_ids.update(int(sid) for sid in masks.keys())
+        return (max(used_ids) + 1) if used_ids else 1
+
+    def _sample_region_prompt_points(
+        self,
+        region_mask: np.ndarray,
+        *,
+        positive_count: int = 7,
+        negative_count: int = 4,
+    ) -> tuple[list[list[float]], list[int]]:
+        import cv2
+
+        mask = np.asarray(region_mask).astype(bool)
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            return [], []
+
+        h, w = mask.shape[:2]
+        points: list[list[float]] = []
+        labels: list[int] = []
+        seen: set[tuple[int, int]] = set()
+
+        def _add_point(px: int, py: int, label: int) -> None:
+            px = int(max(0, min(w - 1, px)))
+            py = int(max(0, min(h - 1, py)))
+            key = (px, py, int(label))
+            if (px, py) in seen:
+                return
+            seen.add((px, py))
+            points.append([float(px), float(py)])
+            labels.append(int(label))
+
+        # Positive centroid
+        cx = int(round(float(xs.mean())))
+        cy = int(round(float(ys.mean())))
+        _add_point(cx, cy, 1)
+
+        # Additional positive points sampled across the region pixels
+        n_pos_extra = max(0, int(positive_count) - 1)
+        if n_pos_extra > 0:
+            order = np.linspace(0, len(xs) - 1, num=min(n_pos_extra, len(xs)), dtype=int)
+            for idx in order:
+                _add_point(int(xs[idx]), int(ys[idx]), 1)
+
+        # Negative points from a dilation ring around the selected region
+        mask_u8 = (mask.astype(np.uint8) * 255)
+        k = max(5, int(max(5, min(h, w) * 0.03)))
+        if k % 2 == 0:
+            k += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dilated = cv2.dilate(mask_u8, kernel, iterations=1) > 0
+        ring = np.logical_and(dilated, np.logical_not(mask))
+        nys, nxs = np.where(ring)
+        if len(nxs) > 0:
+            order = np.linspace(0, len(nxs) - 1, num=min(int(negative_count), len(nxs)), dtype=int)
+            for idx in order:
+                _add_point(int(nxs[idx]), int(nys[idx]), 0)
+
+        return points, labels
 
     def _current_split_source_masks(
         self,
@@ -879,6 +1306,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Video", "Please load a video first.")
             return
         self._cancel_split_polygon_mode(rerender=False)
+        self._cancel_entity_lasso_mode(rerender=False)
 
         prompt = self.action_bar.text_prompt()
         frame_idx = self._current_frame_idx
@@ -1248,6 +1676,9 @@ class MainWindow(QMainWindow):
                 "Assign this entity with a left click before right-click refinement."
             )
             return False
+        if obj_hint is None and point_label == 1:
+            current_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+            obj_hint = self._next_available_sam_id(current_masks)
 
         self._push_sam3_undo("refine mask with point", frame_idx=self._prompt_frame_idx)
         outputs = self._engine.add_point_prompt(
@@ -1391,6 +1822,25 @@ class MainWindow(QMainWindow):
         self._start_split_polygon_mode()
 
     def _on_viewer_lasso_started(self, x: int, y: int) -> None:
+        if (not self._split_polygon_active) and self._can_begin_entity_lasso_refine():
+            selected_mouse = self.identity_panel.selected_mouse()
+            if selected_mouse is not None:
+                if (
+                    not self._entity_lasso_active
+                    or self._entity_lasso_frame_idx != self._current_frame_idx
+                    or self._entity_lasso_mouse_id != selected_mouse
+                ):
+                    self._start_entity_lasso_mode(selected_mouse)
+                self._entity_lasso_points.clear()
+                self._append_entity_lasso_point(x, y)
+                self._render_frame(self._current_frame_idx)
+                name = self.identity_panel.entity_name(selected_mouse)
+                mode_text = "add/refine" if self._entity_lasso_add_mode else "detect"
+                self.lbl_status.setText(
+                    f"Region {mode_text} for {name}: release to run SAM3 on this region."
+                )
+                return
+
         if not self._can_begin_split_polygon_mode():
             return
 
@@ -1413,6 +1863,14 @@ class MainWindow(QMainWindow):
 
     def _on_viewer_lasso_moved(self, x: int, y: int) -> None:
         if (
+            self._entity_lasso_active
+            and self._entity_lasso_frame_idx == self._current_frame_idx
+        ):
+            if self._append_entity_lasso_point(x, y, min_distance=3):
+                self._render_frame(self._current_frame_idx)
+            return
+
+        if (
             not self._split_polygon_active
             or not self._split_polygon_freehand
             or self._split_polygon_frame_idx != self._current_frame_idx
@@ -1423,6 +1881,14 @@ class MainWindow(QMainWindow):
             self._render_frame(self._current_frame_idx)
 
     def _on_viewer_lasso_finished(self, x: int, y: int) -> None:
+        if (
+            self._entity_lasso_active
+            and self._entity_lasso_frame_idx == self._current_frame_idx
+        ):
+            self._append_entity_lasso_point(x, y, min_distance=1)
+            self._apply_entity_lasso_refine()
+            return
+
         if (
             not self._split_polygon_active
             or not self._split_polygon_freehand
@@ -1794,6 +2260,8 @@ class MainWindow(QMainWindow):
     def _on_example_remove_requested(self, frame_idx: int) -> None:
         if self._split_polygon_frame_idx == frame_idx:
             self._cancel_split_polygon_mode(rerender=False)
+        if self._entity_lasso_frame_idx == frame_idx:
+            self._cancel_entity_lasso_mode(rerender=False)
         self.examples_panel.remove_example(frame_idx)
         self._segmentation_examples.pop(frame_idx, None)
         self._all_masks.pop(frame_idx, None)
@@ -1809,6 +2277,7 @@ class MainWindow(QMainWindow):
 
     def _on_examples_clear_requested(self) -> None:
         self._cancel_split_polygon_mode(rerender=False)
+        self._cancel_entity_lasso_mode(rerender=False)
         for frame_idx in list(self._segmentation_examples.keys()):
             self._all_masks.pop(frame_idx, None)
         self._segmentation_examples.clear()
@@ -2102,6 +2571,20 @@ class MainWindow(QMainWindow):
         key = int(event.key())
         if key == int(Qt.Key_Escape) and self._split_polygon_active:
             self._cancel_split_polygon_mode("Split mode cancelled.")
+        elif key == int(Qt.Key_Escape) and self._entity_lasso_active:
+            self._cancel_entity_lasso_mode("Region refine cancelled.")
+        elif (
+            (event.modifiers() & Qt.ControlModifier)
+            and key in (int(Qt.Key_Plus), int(Qt.Key_Equal))
+            and self._can_begin_entity_lasso_refine()
+        ):
+            mouse_id = self.identity_panel.selected_mouse()
+            if mouse_id is not None:
+                self._entity_lasso_add_mode = True
+                name = self.identity_panel.entity_name(mouse_id)
+                self.lbl_status.setText(
+                    f"Add mode for {name}: next Ctrl-drag will add this region."
+                )
         elif key in self._entity_keys and not event.isAutoRepeat():
             n = self._entity_keys[key]
             if self.identity_panel.select_nth_entity(n):
