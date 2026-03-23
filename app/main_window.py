@@ -1,5 +1,6 @@
 """MainWindow with docked layout for MouseTracker Pro."""
 
+import copy
 import logging
 import re
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QPixmap
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -140,6 +141,8 @@ class MainWindow(QMainWindow):
         self._rejected_masks: dict[int, np.ndarray] = {}  # SAM obj IDs rejected by filter
         self._prompt_points: list[tuple[int, int, int]] = []  # (x, y, label) refinement clicks
         self._segmentation_examples: dict[int, dict] = {}  # {frame_idx: {"prompt": str, "obj_count": int}}
+        self._sam3_undo_by_frame: dict[int, list[dict]] = {}
+        self._sam3_redo_by_frame: dict[int, list[dict]] = {}
         self._split_polygon_active: bool = False
         self._split_polygon_frame_idx: Optional[int] = None
         self._split_polygon_points: list[tuple[int, int]] = []
@@ -164,6 +167,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.lbl_status = QLabel("Ready — load a video to begin")
         self.status_bar.addWidget(self.lbl_status)
+        self._update_undo_redo_state()
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -310,6 +314,8 @@ class MainWindow(QMainWindow):
 
         # Action bar
         self.action_bar.segment_requested.connect(self._run_text_prompt)
+        self.action_bar.undo_requested.connect(self._undo_last_sam3_action)
+        self.action_bar.redo_requested.connect(self._redo_last_sam3_action)
         self.action_bar.track_requested.connect(self._start_tracking)
         self.action_bar.free_track_requested.connect(self._start_free_track)
         self.action_bar.stop_requested.connect(self._stop_tracking)
@@ -390,11 +396,14 @@ class MainWindow(QMainWindow):
             self._rejected_masks = {}
             self._prompt_points.clear()
             self._segmentation_examples.clear()
+            self._sam3_undo_by_frame.clear()
+            self._sam3_redo_by_frame.clear()
             self.examples_panel.clear_examples()
             self.progress_widget.reset()
 
             self.lbl_status.setText(f"Loaded: {info.name}")
             logger.info(f"Video loaded: {path}")
+            self._update_undo_redo_state()
 
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to load video:\n{e}")
@@ -429,6 +438,7 @@ class MainWindow(QMainWindow):
         self.identity_panel.set_current_frame(frame_idx)
         self._render_frame(frame_idx)
         self._update_assignment_cursor()
+        self._update_undo_redo_state()
 
     def _render_frame(self, frame_idx: int) -> None:
         """Read and display a frame with all overlays."""
@@ -858,6 +868,7 @@ class MainWindow(QMainWindow):
 
         mask_list = mask_list[:best_index] + best_splits + mask_list[best_index + 1:]
         self._cancel_split_polygon_mode(rerender=False)
+        self._push_sam3_undo("split polygon", frame_idx=frame_idx)
         self._commit_split_masks(frame_idx, mask_list, len(masks), n_entities)
 
     # ── Interactive segmentation (click-to-assign) ─────────────────────────────
@@ -871,6 +882,7 @@ class MainWindow(QMainWindow):
 
         prompt = self.action_bar.text_prompt()
         frame_idx = self._current_frame_idx
+        self._push_sam3_undo(f"segment frame {frame_idx}", frame_idx=frame_idx)
         self._prompt_frame_idx = frame_idx
         self._prompt_points.clear()
         self.progress_widget.set_indeterminate(f"Segmenting frame {frame_idx}…")
@@ -1150,6 +1162,7 @@ class MainWindow(QMainWindow):
 
         # Assign identity and, when possible, swap with the previous owner so a
         # wrong auto-assignment can be corrected with a single click.
+        self._push_sam3_undo(f"assign entity {mouse_id}", frame_idx=self._prompt_frame_idx)
         old_sam_id = self._identity_mgr.sam_id_for_mouse(mouse_id)
         other_mouse_id = self._identity_mgr.mouse_id_for_sam(clicked_sam_id)
         swapped_mouse_id: Optional[int] = None
@@ -1236,6 +1249,7 @@ class MainWindow(QMainWindow):
             )
             return False
 
+        self._push_sam3_undo("refine mask with point", frame_idx=self._prompt_frame_idx)
         outputs = self._engine.add_point_prompt(
             0,  # single-frame session always has frame index 0
             [[float(x), float(y)]],
@@ -1317,6 +1331,7 @@ class MainWindow(QMainWindow):
             return
 
         # Store split masks and re-render
+        self._push_sam3_undo("split merged masks", frame_idx=frame_idx)
         self._all_masks[frame_idx] = {i + 1: m for i, m in enumerate(new_masks.values())}
         # Rebuild pending outputs so filter preview and assignment still work
         # Update the SAM outputs to reflect the new mask count
@@ -1498,6 +1513,164 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(image)
         return pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+    @staticmethod
+    def _clone_masks(masks: Optional[dict[int, np.ndarray]]) -> Optional[dict[int, np.ndarray]]:
+        if masks is None:
+            return None
+        return {int(k): np.array(v, copy=True) for k, v in masks.items()}
+
+    @staticmethod
+    def _clone_outputs(outputs: Optional[dict]) -> Optional[dict]:
+        if outputs is None:
+            return None
+        clone: dict = {}
+        for key, value in outputs.items():
+            if isinstance(value, np.ndarray):
+                clone[key] = np.array(value, copy=True)
+            else:
+                clone[key] = copy.deepcopy(value)
+        return clone
+
+    def _clone_example_entry(self, entry: Optional[dict]) -> Optional[dict]:
+        if entry is None:
+            return None
+        cloned: dict = {}
+        for key, value in entry.items():
+            if key == "outputs":
+                cloned[key] = self._clone_outputs(value)
+            elif isinstance(value, np.ndarray):
+                cloned[key] = np.array(value, copy=True)
+            else:
+                cloned[key] = copy.deepcopy(value)
+        return cloned
+
+    def _capture_sam3_snapshot(self, frame_idx: int, action: str) -> dict:
+        frame_idx = int(frame_idx)
+        frame_entry = self._segmentation_examples.get(frame_idx)
+        entry_outputs = frame_entry.get("outputs") if frame_entry else None
+        pending_outputs = (
+            self._pending_outputs
+            if self._prompt_frame_idx == frame_idx
+            else entry_outputs
+        )
+        rejected_masks = self._rejected_masks if self._prompt_frame_idx == frame_idx else {}
+        prompt_points = self._prompt_points if self._prompt_frame_idx == frame_idx else []
+        return {
+            "action": str(action).strip() or "SAM3 edit",
+            "frame_idx": frame_idx,
+            "prompt_frame_idx": frame_idx,
+            "pending_outputs": self._clone_outputs(pending_outputs),
+            "frame_masks": self._clone_masks(self._all_masks.get(frame_idx)),
+            "identity_mapping": dict(self._identity_mgr.get_full_mapping()),
+            "rejected_masks": self._clone_masks(rejected_masks) or {},
+            "prompt_points": list(prompt_points),
+            "example_entry": self._clone_example_entry(frame_entry),
+        }
+
+    def _update_undo_redo_state(self) -> None:
+        frame_idx = int(self._current_frame_idx)
+        can_undo = bool(self._sam3_undo_by_frame.get(frame_idx))
+        can_redo = bool(self._sam3_redo_by_frame.get(frame_idx))
+        self.action_bar.set_undo_redo_enabled(can_undo, can_redo)
+
+    def _push_sam3_undo(self, action: str, frame_idx: Optional[int] = None) -> None:
+        target_frame = int(self._current_frame_idx if frame_idx is None else frame_idx)
+        snapshot = self._capture_sam3_snapshot(target_frame, action)
+        undo_stack = self._sam3_undo_by_frame.setdefault(target_frame, [])
+        undo_stack.append(snapshot)
+        if len(undo_stack) > 50:
+            undo_stack.pop(0)
+        self._sam3_redo_by_frame[target_frame] = []
+        self._update_undo_redo_state()
+
+    def _restore_sam3_snapshot(self, snapshot: dict) -> None:
+        frame_idx = int(snapshot.get("frame_idx", self._prompt_frame_idx))
+        self._prompt_frame_idx = int(snapshot.get("prompt_frame_idx", frame_idx))
+        self._pending_outputs = self._clone_outputs(snapshot.get("pending_outputs"))
+        self._rejected_masks = self._clone_masks(snapshot.get("rejected_masks")) or {}
+        self._prompt_points = list(snapshot.get("prompt_points") or [])
+
+        restored_masks = self._clone_masks(snapshot.get("frame_masks"))
+        if restored_masks is None:
+            self._all_masks.pop(frame_idx, None)
+        else:
+            self._all_masks[frame_idx] = restored_masks
+
+        example_entry = self._clone_example_entry(snapshot.get("example_entry"))
+        if example_entry is None:
+            self._segmentation_examples.pop(frame_idx, None)
+            self.examples_panel.remove_example(frame_idx)
+        else:
+            self._segmentation_examples[frame_idx] = example_entry
+            thumb = None
+            if self._video_reader is not None:
+                frame = self._video_reader.read_frame(frame_idx)
+                thumb = self._make_thumbnail_pixmap(frame) if frame is not None else None
+            self.examples_panel.upsert_example(frame_idx, thumb)
+
+        self._identity_mgr.reset()
+        self._identity_mgr.set_n_mice(self.identity_panel.entity_count())
+        restored_mapping = {}
+        for eid, sid in dict(snapshot.get("identity_mapping") or {}).items():
+            eid = int(eid)
+            sid = int(sid)
+            if eid in self.identity_panel._entities:
+                self._identity_mgr.assign(eid, sid)
+                restored_mapping[eid] = sid
+        self.identity_panel.sync_assignments(restored_mapping)
+
+        if self._pending_outputs is not None and self._video_reader is not None:
+            info = self._video_reader.info
+            frame_shape = (info.height, info.width)
+            sam_masks, rejected = self._to_filtered_masks(self._pending_outputs, frame_shape)
+            self._rejected_masks = rejected
+            self._refresh_prompt_assignment_ui(frame_idx, sam_masks)
+            if restored_mapping and sam_masks:
+                self._tracker.initialize(frame_idx, sam_masks, restored_mapping)
+        else:
+            self.identity_panel.clear_detection_status()
+            self._update_example_assignment_note(frame_idx)
+            self._update_assignment_cursor()
+
+        self._render_frame(self._current_frame_idx)
+        self._update_undo_redo_state()
+
+    def _undo_last_sam3_action(self) -> None:
+        frame_idx = int(self._current_frame_idx)
+        undo_stack = self._sam3_undo_by_frame.get(frame_idx)
+        if not undo_stack:
+            self.lbl_status.setText("Nothing to undo.")
+            self._update_undo_redo_state()
+            return
+
+        snapshot = undo_stack.pop()
+        redo_snapshot = self._capture_sam3_snapshot(frame_idx, f"redo {snapshot.get('action', '')}".strip())
+        redo_stack = self._sam3_redo_by_frame.setdefault(frame_idx, [])
+        redo_stack.append(redo_snapshot)
+        if len(redo_stack) > 50:
+            redo_stack.pop(0)
+        self._restore_sam3_snapshot(snapshot)
+        action = str(snapshot.get("action") or "SAM3 edit")
+        self.lbl_status.setText(f"Undid: {action}")
+
+    def _redo_last_sam3_action(self) -> None:
+        frame_idx = int(self._current_frame_idx)
+        redo_stack = self._sam3_redo_by_frame.get(frame_idx)
+        if not redo_stack:
+            self.lbl_status.setText("Nothing to redo.")
+            self._update_undo_redo_state()
+            return
+
+        snapshot = redo_stack.pop()
+        undo_snapshot = self._capture_sam3_snapshot(frame_idx, f"undo {snapshot.get('action', '')}".strip())
+        undo_stack = self._sam3_undo_by_frame.setdefault(frame_idx, [])
+        undo_stack.append(undo_snapshot)
+        if len(undo_stack) > 50:
+            undo_stack.pop(0)
+        self._restore_sam3_snapshot(snapshot)
+        action = str(snapshot.get("action") or "SAM3 edit")
+        self.lbl_status.setText(f"Redid: {action}")
+
     def _outputs_from_masks(self, masks: dict[int, np.ndarray]) -> dict:
         out_ids: list[int] = []
         out_masks: list[np.ndarray] = []
@@ -1624,11 +1797,14 @@ class MainWindow(QMainWindow):
         self.examples_panel.remove_example(frame_idx)
         self._segmentation_examples.pop(frame_idx, None)
         self._all_masks.pop(frame_idx, None)
+        self._sam3_undo_by_frame.pop(int(frame_idx), None)
+        self._sam3_redo_by_frame.pop(int(frame_idx), None)
         if frame_idx == self._prompt_frame_idx:
             self._engine.close_session()
             self._pending_outputs = None
             self._prompt_frame_idx = self._current_frame_idx
         self._render_frame(self._current_frame_idx)
+        self._update_undo_redo_state()
         self.lbl_status.setText(f"Removed example frame {frame_idx}")
 
     def _on_examples_clear_requested(self) -> None:
@@ -1636,6 +1812,8 @@ class MainWindow(QMainWindow):
         for frame_idx in list(self._segmentation_examples.keys()):
             self._all_masks.pop(frame_idx, None)
         self._segmentation_examples.clear()
+        self._sam3_undo_by_frame.clear()
+        self._sam3_redo_by_frame.clear()
         self.examples_panel.clear_examples()
         self._pending_outputs = None
         self._prompt_frame_idx = self._current_frame_idx
@@ -1645,6 +1823,7 @@ class MainWindow(QMainWindow):
             self._identity_mgr.reset()
             self.identity_panel.reset()
         self._render_frame(self._current_frame_idx)
+        self._update_undo_redo_state()
         self.lbl_status.setText("Segmentation examples cleared")
 
     def _on_capture_frame(self) -> None:
@@ -1911,6 +2090,13 @@ class MainWindow(QMainWindow):
         focused = QApplication.focusWidget()
         if isinstance(focused, (QLineEdit, QTextEdit, QAbstractSpinBox)):
             super().keyPressEvent(event)
+            return
+
+        if event.matches(QKeySequence.StandardKey.Undo) and not event.isAutoRepeat():
+            self._undo_last_sam3_action()
+            return
+        if event.matches(QKeySequence.StandardKey.Redo) and not event.isAutoRepeat():
+            self._redo_last_sam3_action()
             return
 
         key = int(event.key())

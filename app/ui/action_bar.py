@@ -34,6 +34,8 @@ class ActionBar(QWidget):
     """Compact two-row action bar with prompt, segment/track, and export controls."""
 
     segment_requested = Signal()
+    undo_requested = Signal()
+    redo_requested = Signal()
     track_requested = Signal()
     free_track_requested = Signal()
     stop_requested = Signal()
@@ -113,6 +115,22 @@ class ActionBar(QWidget):
         )
         self.btn_segment.clicked.connect(self.segment_requested)
         row1.addWidget(self.btn_segment)
+
+        self.btn_undo = QPushButton("Undo (Ctrl+Z)")
+        self.btn_undo.setFixedHeight(24)
+        self.btn_undo.setObjectName("secondary_button")
+        self.btn_undo.setToolTip("Undo the last SAM3 edit on the current frame")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.clicked.connect(self.undo_requested)
+        row1.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("Redo (Ctrl+Y)")
+        self.btn_redo.setFixedHeight(24)
+        self.btn_redo.setObjectName("secondary_button")
+        self.btn_redo.setToolTip("Redo the last undone SAM3 edit on the current frame")
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.clicked.connect(self.redo_requested)
+        row1.addWidget(self.btn_redo)
 
         self.btn_track = QPushButton("▶ Track")
         self.btn_track.setFixedHeight(24)
@@ -314,6 +332,10 @@ class ActionBar(QWidget):
         self.btn_free_track.setEnabled(not active)
         self.btn_stop.setEnabled(active)
         self.btn_segment.setEnabled(not active)
+
+    def set_undo_redo_enabled(self, can_undo: bool, can_redo: bool) -> None:
+        self.btn_undo.setEnabled(bool(can_undo))
+        self.btn_redo.setEnabled(bool(can_redo))
 
     def get_shortcut_names(self) -> dict[int, str]:
         return {
