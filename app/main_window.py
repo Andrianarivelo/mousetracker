@@ -1101,14 +1101,19 @@ class MainWindow(QMainWindow):
         if obj_hint is None:
             obj_hint = self._next_available_sam_id(current_masks)
 
-        obj_hint = int(obj_hint)
-        self._identity_mgr.assign(mouse_id, obj_hint)
-        self.identity_panel.mark_assigned(mouse_id, obj_hint)
+        prompt_obj_id = int(obj_hint)
+        mapping_before = self._identity_mgr.get_full_mapping()
+        selected_sid_existing = mapping_before.get(int(mouse_id))
+        hint_owner_mouse = self._identity_mgr.mouse_id_for_sam(prompt_obj_id)
 
         self._push_sam3_undo(f"region refine entity {mouse_id}", frame_idx=frame_idx)
 
         add_mode = bool(self._entity_lasso_add_mode)
-        base_mask = current_masks.get(obj_hint)
+        base_mask = (
+            current_masks.get(int(selected_sid_existing))
+            if selected_sid_existing is not None
+            else None
+        )
         points, point_labels = self._sample_region_prompt_points(
             region_mask,
             positive_count=3 if add_mode else 1,
@@ -1123,7 +1128,7 @@ class MainWindow(QMainWindow):
             0,
             points,
             point_labels,
-            obj_id=obj_hint,
+            obj_id=prompt_obj_id,
             frame_shape=frame_shape,
         )
 
@@ -1133,12 +1138,12 @@ class MainWindow(QMainWindow):
         best_score = -1.0
         best_overlap = 0
         region_area = max(1, int(region_mask.sum()))
-        if obj_hint in sam_masks_raw:
-            hinted_mask = sam_masks_raw[int(obj_hint)]
+        if prompt_obj_id in sam_masks_raw:
+            hinted_mask = sam_masks_raw[int(prompt_obj_id)]
             hinted_overlap = int(np.logical_and(hinted_mask, region_mask).sum())
             if hinted_overlap > 0:
                 hinted_area = max(1, int(hinted_mask.sum()))
-                best_sid = int(obj_hint)
+                best_sid = int(prompt_obj_id)
                 best_overlap = hinted_overlap
                 best_score = (hinted_overlap / hinted_area) + (hinted_overlap / region_area)
         for sid, mask in sam_masks_raw.items():
@@ -1152,8 +1157,8 @@ class MainWindow(QMainWindow):
                 best_overlap = overlap
                 best_sid = int(sid)
         if best_sid is None:
-            if obj_hint in sam_masks_raw:
-                best_sid = int(obj_hint)
+            if prompt_obj_id in sam_masks_raw:
+                best_sid = int(prompt_obj_id)
             else:
                 self._cancel_entity_lasso_mode(
                     "No mouse detected inside the selected region.",
@@ -1166,37 +1171,66 @@ class MainWindow(QMainWindow):
                 "No mouse detected inside the selected region.",
             )
             return
-        selected_mask = np.logical_and(selected_mask.astype(bool), region_mask)
+        selected_mask = selected_mask.astype(bool)
         if selected_mask.any():
             comp_count, comp_labels, comp_stats, _ = cv2.connectedComponentsWithStats(
                 selected_mask.astype(np.uint8),
                 connectivity=8,
             )
-            if comp_count > 2:
-                largest_idx = 1 + int(np.argmax(comp_stats[1:, cv2.CC_STAT_AREA]))
-                selected_mask = comp_labels == largest_idx
+            if comp_count > 1:
+                best_comp_idx = None
+                best_comp_overlap = 0
+                best_comp_area = 0
+                for comp_idx in range(1, comp_count):
+                    comp_mask = comp_labels == comp_idx
+                    overlap = int(np.logical_and(comp_mask, region_mask).sum())
+                    if overlap <= 0:
+                        continue
+                    area = int(comp_stats[comp_idx, cv2.CC_STAT_AREA])
+                    if (
+                        overlap > best_comp_overlap
+                        or (overlap == best_comp_overlap and area > best_comp_area)
+                    ):
+                        best_comp_overlap = overlap
+                        best_comp_area = area
+                        best_comp_idx = comp_idx
+                if best_comp_idx is not None:
+                    selected_mask = comp_labels == best_comp_idx
+        # In Ctrl-draw region detect mode, keep only pixels inside the user region.
+        selected_mask = np.logical_and(selected_mask, region_mask)
         if int(selected_mask.sum()) < 20:
             self._cancel_entity_lasso_mode(
                 "No clear mouse mask found in that region. Draw tighter around one animal.",
             )
             return
+
+        used_sids = {int(sid) for sid in mapping_before.values()}
+        if selected_sid_existing is not None:
+            target_sid = int(selected_sid_existing)
+        elif hint_owner_mouse is None:
+            target_sid = int(prompt_obj_id)
+        else:
+            used_sid_masks = {
+                int(sid): np.zeros(frame_shape, dtype=bool) for sid in used_sids
+            }
+            used_sid_masks.update(
+                {int(sid): np.asarray(mask).astype(bool) for sid, mask in current_masks.items()}
+            )
+            target_sid = int(self._next_available_sam_id(used_sid_masks))
+
+        base_mask = current_masks.get(target_sid, base_mask)
         if add_mode and base_mask is not None:
             selected_mask = np.logical_or(base_mask.astype(bool), selected_mask.astype(bool))
 
-        target_sid = int(obj_hint)
         self._identity_mgr.assign(mouse_id, target_sid)
         self.identity_panel.mark_assigned(mouse_id, target_sid)
         self._size_validator.record(mouse_id, selected_mask)
 
         mapping = self._identity_mgr.get_full_mapping()
-        stable_sid_masks: dict[int, np.ndarray] = {target_sid: selected_mask}
-        for mid, sid in mapping.items():
-            sid = int(sid)
-            if mid == mouse_id or sid == target_sid:
-                continue
-            prev_mask = current_masks.get(sid)
-            if prev_mask is not None:
-                stable_sid_masks[sid] = prev_mask
+        stable_sid_masks: dict[int, np.ndarray] = {
+            int(sid): np.asarray(mask).astype(bool) for sid, mask in current_masks.items()
+        }
+        stable_sid_masks[target_sid] = selected_mask
 
         self._pending_outputs = self._outputs_from_masks(stable_sid_masks)
         self._prompt_frame_idx = frame_idx
