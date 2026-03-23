@@ -878,6 +878,22 @@ class MainWindow(QMainWindow):
 
         try:
             if not self._engine.is_loaded():
+                from app.config import get_sam3_checkpoint, set_runtime_sam3_checkpoint
+
+                if not get_sam3_checkpoint():
+                    ckpt_path, _ = QFileDialog.getOpenFileName(
+                        self,
+                        "Select SAM3 Checkpoint",
+                        str(Path(self._video_path).parent if self._video_path else Path.cwd()),
+                        "SAM3 checkpoint (*.pt *.safetensors);;All files (*)",
+                    )
+                    if not ckpt_path:
+                        self.progress_widget.set_determinate()
+                        self.progress_widget.reset("Segmentation canceled")
+                        self.lbl_status.setText("SAM3 checkpoint selection canceled")
+                        return
+                    set_runtime_sam3_checkpoint(ckpt_path)
+
                 self.progress_widget.set_indeterminate("Loading SAM3 model…")
                 self._engine.load_model()
 
