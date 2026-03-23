@@ -7,12 +7,13 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QKeyEvent, QPixmap
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -56,27 +57,17 @@ from app.core.video_io import (
     draw_entity_labels,
     draw_keypoints,
 )
-from app.ui.dock_manager import (
-    DOCK_EXAMPLES,
-    DOCK_FILES,
-    DOCK_IDENTITY,
-    DOCK_KEYPOINTS,
-    DOCK_PREPROCESS,
-    DOCK_ROI,
-    DOCK_SETTINGS,
-    DOCK_VIEWER,
-    DockManager,
-)
 from app.ui.examples_panel import ExamplesPanel
 from app.ui.export_dialog import ExportDialog
+from app.ui.action_bar import ActionBar
 from app.ui.file_panel import FilePanel
+from app.ui.filter_panel import FilterPanel
 from app.ui.fine_tune_dialog import FineTuneDialog
 from app.ui.identity_panel import IdentityPanel
 from app.ui.keypoint_panel import KeypointPanel
 from app.ui.preprocessing_panel import PreprocessingPanel
 from app.ui.progress_widget import ProgressWidget
 from app.ui.roi_drawer import ROIOverlayManager, ROIPanel, draw_rois_on_frame
-from app.ui.settings_panel import SettingsPanel
 from app.ui.style import DARK_THEME_QSS
 from app.ui.timeline_widget import TimelineWidget
 from app.ui.video_viewer import VideoViewer
@@ -97,11 +88,21 @@ class MainWindow(QMainWindow):
     Top-level application window for MouseTracker Pro.
 
     Layout:
-      Left:   FilePanel + PreprocessingPanel (tabbed)
-      Center: VideoViewer + TimelineWidget
-      Right:  IdentityPanel + KeypointPanel + ROIPanel (tabbed)
-      Bottom: SettingsPanel + ProgressWidget
+      Central:  VideoViewer + Timeline + ActionBar + ProgressWidget
+      Right bar: Identity, Filter, File, Preprocess, Dataset, Keypoints, ROI
     """
+
+    @classmethod
+    def create_as_widget(cls, parent=None) -> "QWidget":
+        """Embed MouseTracker Pro inside another widget (e.g. a QTabWidget).
+
+        Converts the QMainWindow into an embedded widget by setting
+        Qt.WindowType.Widget on it, so it behaves as a child panel rather
+        than a top-level window while retaining full dock-widget functionality.
+        """
+        win = cls()
+        win.setWindowFlags(Qt.WindowType.Widget)
+        return win
 
     def __init__(self) -> None:
         super().__init__()
@@ -167,88 +168,62 @@ class MainWindow(QMainWindow):
     # ── UI Construction ───────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # Central widget: VideoViewer + Timeline stacked vertically
-        central = QWidget()
-        central_layout = QVBoxLayout(central)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.setSpacing(0)
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sam3_root = str(_Path(__file__).parent.parent.parent)
+        if _sam3_root not in _sys.path:
+            _sys.path.insert(0, _sam3_root)
+        from shared.sidebar_layout import SidebarLayout
 
-        self.viewer = VideoViewer()
-        central_layout.addWidget(self.viewer, stretch=1)
-
-        self.timeline = TimelineWidget()
-        central_layout.addWidget(self.timeline)
-
-        self.setCentralWidget(central)
-
-        # Dock manager
-        self.dock_mgr = DockManager(self)
-
-        # ── Left docks ────────────────────────────────────────────────────────
-        self.file_panel = FilePanel()
-        self.dock_mgr.create_dock(DOCK_FILES, self.file_panel, Qt.LeftDockWidgetArea, min_width=200)
-
-        self.preprocess_panel = PreprocessingPanel()
-        self.dock_mgr.create_dock(DOCK_PREPROCESS, self.preprocess_panel, Qt.LeftDockWidgetArea, min_width=200)
-
-        self.examples_panel = ExamplesPanel()
+        # ── Instantiate all panels ─────────────────────────────────────────────
+        self.file_panel        = FilePanel()
+        self.identity_panel    = IdentityPanel()
+        self.preprocess_panel  = PreprocessingPanel()
+        self.examples_panel    = ExamplesPanel()
         self.examples_panel.set_split_mode_active(False)
-        self.dock_mgr.create_dock(DOCK_EXAMPLES, self.examples_panel, Qt.LeftDockWidgetArea, min_width=240)
+        self.keypoint_panel    = KeypointPanel()
+        self.roi_panel         = ROIPanel(self._roi_analyzer)
+        self.filter_panel      = FilterPanel()
+        self.action_bar        = ActionBar()
+        self.progress_widget   = ProgressWidget()
+        self.viewer            = VideoViewer()
+        self.timeline          = TimelineWidget()
 
-        self.dock_mgr.tabify_docks(DOCK_FILES, DOCK_PREPROCESS, DOCK_EXAMPLES)
+        # ── Build sidebar layout (right-side vertical bar) ─────────────────────
+        sidebar = SidebarLayout(bar_position="right")
 
-        # ── Right docks ───────────────────────────────────────────────────────
-        self.identity_panel = IdentityPanel()
-        self.dock_mgr.create_dock(DOCK_IDENTITY, self.identity_panel, Qt.RightDockWidgetArea, min_width=200)
+        # Right-bar activity buttons
+        sidebar.add_activity("identity",   "mouse-pointer", "Identity",   "Identity",            self.identity_panel)
+        sidebar.add_bar_separator()
+        sidebar.add_activity("filter",     "sliders",       "Filter",     "Filters",             self.filter_panel)
+        sidebar.add_activity("file",       "folder-open",   "File",       "File Manager",        self.file_panel)
+        sidebar.add_activity("preprocess", "upload",        "Preprocess", "Preprocessing",       self.preprocess_panel)
+        sidebar.add_activity("dataset",    "layers",        "Dataset",    "Dataset",             self.examples_panel)
+        sidebar.add_activity("keypoints",  "crosshair",     "Keypoints",  "Keypoints",           self.keypoint_panel)
+        sidebar.add_activity("roi",        "map-pin",       "ROI",        "Regions of Interest", self.roi_panel)
 
-        self.keypoint_panel = KeypointPanel()
-        self.dock_mgr.create_dock(DOCK_KEYPOINTS, self.keypoint_panel, Qt.RightDockWidgetArea, min_width=200)
+        # Central: video viewer + timeline + action bar + progress (pinned below)
+        center = QWidget()
+        center_lay = QVBoxLayout(center)
+        center_lay.setContentsMargins(0, 0, 0, 0)
+        center_lay.setSpacing(0)
+        center_lay.addWidget(self.viewer, 1)
+        center_lay.addWidget(self.timeline)
+        center_lay.addWidget(self.action_bar)
+        center_lay.addWidget(self.progress_widget)
+        sidebar.set_central(center)
 
-        self.roi_panel = ROIPanel(self._roi_analyzer)
-        self.dock_mgr.create_dock(DOCK_ROI, self.roi_panel, Qt.RightDockWidgetArea, min_width=200)
+        # Pre-open identity panel (most used)
+        sidebar.show_activity("identity")
 
-        self.dock_mgr.tabify_docks(DOCK_IDENTITY, DOCK_KEYPOINTS, DOCK_ROI)
-        # Raise identity panel tab
-        identity_dock = self.dock_mgr.get_dock(DOCK_IDENTITY)
-        if identity_dock:
-            identity_dock.raise_()
+        # Store reference so _connect_signals can reach it
+        self._sidebar = sidebar
 
-        # ── Bottom docks ──────────────────────────────────────────────────────
-        from PySide6.QtWidgets import QDockWidget, QScrollArea
+        # Embed sidebar as the central widget of the QMainWindow
+        self.setCentralWidget(sidebar)
 
-        self.settings_panel = SettingsPanel()
-        preferred_settings_size = self.settings_panel.minimumSizeHint().expandedTo(
-            self.settings_panel.sizeHint()
-        )
-        self.settings_panel.setMinimumSize(preferred_settings_size)
-
-        settings_scroll = QScrollArea()
-        settings_scroll.setWidget(self.settings_panel)
-        settings_scroll.setWidgetResizable(True)
-        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        settings_scroll.setFrameShape(settings_scroll.Shape.NoFrame)
-        settings_scroll.setMinimumHeight(preferred_settings_size.height() + 8)
-
-        self.progress_widget = ProgressWidget()
-        self._bottom_dock_height = max(
-            190,
-            preferred_settings_size.height() + self.progress_widget.sizeHint().height() + 20,
-        )
-
-        bottom_widget = QWidget()
-        bottom_layout = QVBoxLayout(bottom_widget)
-        bottom_layout.setContentsMargins(0, 2, 0, 2)
-        bottom_layout.setSpacing(2)
-        bottom_layout.addWidget(settings_scroll)
-        bottom_layout.addWidget(self.progress_widget)
-
-        self.dock_mgr.create_dock(
-            DOCK_SETTINGS, bottom_widget, Qt.BottomDockWidgetArea,
-            min_height=self._bottom_dock_height,
-            features=QDockWidget.NoDockWidgetFeatures,
-        )
-        QTimer.singleShot(0, self._apply_initial_dock_sizes)
+        # Accept drag-and-drop on the whole window
+        self.setAcceptDrops(True)
 
         # ROI overlay manager
         self._roi_overlay = ROIOverlayManager(self.roi_panel, self._roi_analyzer)
@@ -267,13 +242,6 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
-        # View menu
-        view_menu = menubar.addMenu("View")
-        for name, dock in self.dock_mgr.all_docks().items():
-            action = dock.toggleViewAction()
-            action.setText(name)
-            view_menu.addAction(action)
-
         # Track menu
         track_menu = menubar.addMenu("Track")
         track_menu.addAction("Segment Current Frame", self._run_text_prompt)
@@ -286,17 +254,33 @@ class MainWindow(QMainWindow):
         export_menu = menubar.addMenu("Export")
         export_menu.addAction("Export…", self._show_export_dialog)
 
+    # ── Global drag-and-drop ─────────────────────────────────────────────────
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        from app.ui.file_panel import VIDEO_EXTENSIONS, _collect_videos_from_dir
+        paths: list[str] = []
+        for url in event.mimeData().urls():
+            p = url.toLocalFile()
+            if Path(p).is_dir():
+                paths.extend(_collect_videos_from_dir(p))
+            elif Path(p).suffix.lower() in VIDEO_EXTENSIONS:
+                paths.append(p)
+        if not paths:
+            return
+        # Add to file list
+        self.file_panel._add_videos(paths)
+        # If no video is loaded yet, open the first one
+        if self._video_reader is None:
+            self._load_video(paths[0])
+
     # ── Signal connections ────────────────────────────────────────────────────
 
     def _apply_initial_dock_sizes(self) -> None:
-        settings_dock = self.dock_mgr.get_dock(DOCK_SETTINGS)
-        if settings_dock is None:
-            return
-        self.resizeDocks(
-            [settings_dock],
-            [getattr(self, "_bottom_dock_height", 220)],
-            Qt.Vertical,
-        )
+        pass  # No docks in sidebar layout; sizing is handled by fixed widths
 
     def _connect_signals(self) -> None:
         # File panel
@@ -321,20 +305,17 @@ class MainWindow(QMainWindow):
         self.identity_panel.spin_swap_from.valueChanged.connect(self._sync_swap_flags)
         self.identity_panel.spin_swap_to.valueChanged.connect(self._sync_swap_flags)
 
-        # Settings panel — filter sliders/toggles trigger live preview
-        self.settings_panel.slider_max_area.valueChanged.connect(self._on_filter_preview_changed)
-        self.settings_panel.slider_max_edge.valueChanged.connect(self._on_filter_preview_changed)
-        self.settings_panel.chk_area_filter.stateChanged.connect(self._on_filter_preview_changed)
-        self.settings_panel.chk_edge_filter.stateChanged.connect(self._on_filter_preview_changed)
-        self.settings_panel.chk_raw_sam.stateChanged.connect(self._on_filter_preview_changed)
+        # Filter panel — sliders/toggles trigger live preview
+        self.filter_panel.filter_changed.connect(self._on_filter_preview_changed)
 
-        self.settings_panel.segment_requested.connect(self._run_text_prompt)
-        self.settings_panel.track_requested.connect(self._start_tracking)
-        self.settings_panel.free_track_requested.connect(self._start_free_track)
-        self.settings_panel.stop_requested.connect(self._stop_tracking)
-        self.settings_panel.export_csv_requested.connect(self._export_csv)
-        self.settings_panel.export_h5_requested.connect(self._export_h5)
-        self.settings_panel.export_video_requested.connect(self._export_video_overlay)
+        # Action bar
+        self.action_bar.segment_requested.connect(self._run_text_prompt)
+        self.action_bar.track_requested.connect(self._start_tracking)
+        self.action_bar.free_track_requested.connect(self._start_free_track)
+        self.action_bar.stop_requested.connect(self._stop_tracking)
+        self.action_bar.export_csv_requested.connect(self._export_csv)
+        self.action_bar.export_h5_requested.connect(self._export_h5)
+        self.action_bar.export_video_requested.connect(self._export_video_overlay)
 
         # Keypoint panel
         self.keypoint_panel.estimate_requested.connect(self._estimate_keypoints)
@@ -347,15 +328,15 @@ class MainWindow(QMainWindow):
         self.viewer.crop_drawn.connect(self._on_viewer_crop_drawn)
 
         # Repaint when overlay checkboxes toggle
-        self.settings_panel.chk_show_labels.stateChanged.connect(
+        self.action_bar.chk_show_labels.stateChanged.connect(
             lambda: self._render_frame(self._current_frame_idx)
         )
-        self.settings_panel.chk_show_bbox.stateChanged.connect(
+        self.action_bar.chk_show_bbox.stateChanged.connect(
             lambda: self._render_frame(self._current_frame_idx)
         )
 
         # Keyboard shortcut customization
-        self.settings_panel.shortcuts_changed.connect(self._on_shortcuts_changed)
+        self.action_bar.shortcuts_changed.connect(self._on_shortcuts_changed)
 
         # Segmentation examples panel
         self.examples_panel.frame_selected.connect(self._on_example_frame_selected)
@@ -391,7 +372,7 @@ class MainWindow(QMainWindow):
                 f"{info.frame_count} frames  {info.duration_s:.1f} s"
             )
             self.preprocess_panel.populate_from_video(info.width, info.height, info.duration_s)
-            self.settings_panel.set_video_duration(info.duration_s)
+            self.action_bar.set_video_duration(info.duration_s)
 
             # Show first frame
             frame = self._video_reader.read_frame(0)
@@ -492,7 +473,7 @@ class MainWindow(QMainWindow):
                 )
 
         # Entity labels (ID + confidence)
-        if self.settings_panel.chk_show_labels.isChecked():
+        if self.action_bar.chk_show_labels.isChecked():
             state = self._tracker.get_state_at(frame_idx)
             if state and state.centroids:
                 names = {
@@ -509,7 +490,7 @@ class MainWindow(QMainWindow):
                 )
 
         # Bounding boxes
-        if self.settings_panel.chk_show_bbox.isChecked():
+        if self.action_bar.chk_show_bbox.isChecked():
             state = self._tracker.get_state_at(frame_idx)
             if state and state.bboxes:
                 composite = draw_bboxes(composite, state.bboxes, IDENTITY_COLORS)
@@ -793,7 +774,7 @@ class MainWindow(QMainWindow):
 
         prompt = str(
             self._segmentation_examples.get(frame_idx, {}).get("prompt")
-            or self.settings_panel.text_prompt()
+            or self.action_bar.text_prompt()
         )
         self._record_segmentation_example(
             frame_idx,
@@ -888,7 +869,7 @@ class MainWindow(QMainWindow):
             return
         self._cancel_split_polygon_mode(rerender=False)
 
-        prompt = self.settings_panel.text_prompt()
+        prompt = self.action_bar.text_prompt()
         frame_idx = self._current_frame_idx
         self._prompt_frame_idx = frame_idx
         self._prompt_points.clear()
@@ -1262,7 +1243,7 @@ class MainWindow(QMainWindow):
         self._all_masks[self._prompt_frame_idx] = display_masks
         self._render_frame(self._prompt_frame_idx)
 
-        prompt = self.settings_panel.text_prompt()
+        prompt = self.action_bar.text_prompt()
         obj_count = len(outputs.get("out_obj_ids", []))
         self._record_segmentation_example(self._prompt_frame_idx, prompt, obj_count, outputs)
 
@@ -1455,10 +1436,10 @@ class MainWindow(QMainWindow):
         n_entities = self.identity_panel.entity_count()
         self.identity_panel.set_detection_hint(n, n_entities)
         filters = []
-        if self.settings_panel.area_filter_enabled():
-            filters.append(f"area ≤ {self.settings_panel.slider_max_area.value()}%")
-        if self.settings_panel.edge_filter_enabled():
-            filters.append(f"edge ≤ {self.settings_panel.slider_max_edge.value()}%")
+        if self.filter_panel.area_filter_enabled():
+            filters.append(f"area ≤ {self.filter_panel.slider_max_area.value()}%")
+        if self.filter_panel.edge_filter_enabled():
+            filters.append(f"edge ≤ {self.filter_panel.slider_max_edge.value()}%")
         filter_str = "  ".join(filters) if filters else "no filters"
         self.lbl_status.setText(f"Filter preview: {n} mask(s) pass — {filter_str}")
 
@@ -1476,17 +1457,17 @@ class MainWindow(QMainWindow):
         compact animal blobs even when the area filter is off.
         """
         all_masks = self._engine.outputs_to_masks(outputs, frame_shape)
-        if self.settings_panel.raw_sam_enabled():
+        if self.filter_panel.raw_sam_enabled():
             # Zero filtering — return everything SAM produced
             return all_masks, {}
         n_entities = self.identity_panel.entity_count()
         kept = self._engine.filter_masks(
             all_masks,
             frame_shape,
-            max_area_frac=self.settings_panel.max_area_frac(),
-            max_edge_frac=self.settings_panel.max_edge_frac(),
-            use_area_filter=self.settings_panel.area_filter_enabled(),
-            use_edge_filter=self.settings_panel.edge_filter_enabled(),
+            max_area_frac=self.filter_panel.max_area_frac(),
+            max_edge_frac=self.filter_panel.max_edge_frac(),
+            use_area_filter=self.filter_panel.area_filter_enabled(),
+            use_edge_filter=self.filter_panel.edge_filter_enabled(),
             max_detections=n_entities if n_entities > 0 else 0,
         )
         rejected = {k: v for k, v in all_masks.items() if k not in kept}
@@ -1704,9 +1685,9 @@ class MainWindow(QMainWindow):
         if self._video_reader is None:
             return 0, 0
         info = self._video_reader.info
-        if not self.settings_panel.time_window_enabled():
+        if not self.action_bar.time_window_enabled():
             return 0, info.frame_count
-        start_s, end_s = self.settings_panel.time_window()
+        start_s, end_s = self.action_bar.time_window()
         fps = info.fps if info.fps > 0 else 25.0
         start_f = max(0, int(start_s * fps))
         end_f = min(info.frame_count, int(end_s * fps))
@@ -1719,7 +1700,7 @@ class MainWindow(QMainWindow):
         masks = self._all_masks.get(frame_idx)
         if masks is not None:
             return masks
-        skip = self.settings_panel.frame_skip()
+        skip = self.action_bar.frame_skip()
         for f in range(frame_idx - 1, max(frame_idx - skip, -1), -1):
             masks = self._all_masks.get(f)
             if masks is not None:
@@ -1742,7 +1723,7 @@ class MainWindow(QMainWindow):
             return
         info = self._video_reader.info
 
-        self.settings_panel.set_tracking(True)
+        self.action_bar.set_tracking(True)
         self.viewer.set_assignment_cursor(False)
         self.progress_widget.reset("Starting tracking…")
 
@@ -1770,15 +1751,15 @@ class MainWindow(QMainWindow):
         # Determine frame range from time-window setting
         tw_start, tw_end = self._get_frame_range()
 
-        seg_size = self.settings_panel.segment_size()
+        seg_size = self.action_bar.segment_size()
         track_frames = tw_end - tw_start
         if track_frames > seg_size:
             self.lbl_status.setText(
                 f"Long range ({track_frames} frames) — using chunked mode "
                 f"({seg_size}-frame segments via ffmpeg)"
             )
-        if self.settings_panel.time_window_enabled():
-            start_s, end_s = self.settings_panel.time_window()
+        if self.action_bar.time_window_enabled():
+            start_s, end_s = self.action_bar.time_window()
             self.lbl_status.setText(
                 f"Time window: {start_s:.1f}s – {end_s:.1f}s "
                 f"(frames {tw_start}–{tw_end - 1})"
@@ -1814,15 +1795,15 @@ class MainWindow(QMainWindow):
             initial_masks=initial_masks,
             start_frame=tw_start,
             update_every=VIEWER_UPDATE_EVERY_N_FRAMES,
-            frame_skip=self.settings_panel.frame_skip(),
-            max_area_frac=self.settings_panel.max_area_frac(),
-            max_edge_frac=self.settings_panel.max_edge_frac(),
-            use_area_filter=self.settings_panel.area_filter_enabled(),
-            use_edge_filter=self.settings_panel.edge_filter_enabled(),
-            bypass_filters=self.settings_panel.raw_sam_enabled(),
-            adaptive_reprompt=self.settings_panel.adaptive_reprompt_enabled(),
+            frame_skip=self.action_bar.frame_skip(),
+            max_area_frac=self.filter_panel.max_area_frac(),
+            max_edge_frac=self.filter_panel.max_edge_frac(),
+            use_area_filter=self.filter_panel.area_filter_enabled(),
+            use_edge_filter=self.filter_panel.edge_filter_enabled(),
+            bypass_filters=self.filter_panel.raw_sam_enabled(),
+            adaptive_reprompt=self.action_bar.adaptive_reprompt_enabled(),
             keyframes=keyframes if len(keyframes) >= 2 else None,
-            chunk_size=self.settings_panel.segment_size(),
+            chunk_size=self.action_bar.segment_size(),
             size_validator=self._size_validator if self._size_validator.any_reference() else None,
         )
         self._tracking_worker.progress.connect(self._on_tracking_progress)
@@ -1979,7 +1960,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_frame(frame_idx, emit=True)
 
     def _on_tracking_finished(self, success: bool, error: str) -> None:
-        self.settings_panel.set_tracking(False)
+        self.action_bar.set_tracking(False)
         if success:
             # Post-process: smooth trajectories then detect velocity spikes
             fps = self._video_reader.info.fps if self._video_reader else 25.0
