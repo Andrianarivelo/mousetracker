@@ -153,6 +153,13 @@ class MainWindow(QMainWindow):
         self._entity_lasso_mouse_id: Optional[int] = None
         self._entity_lasso_points: list[tuple[int, int]] = []
         self._entity_lasso_add_mode: bool = False
+        self._entity_paint_mode: bool = False
+        self._entity_paint_add_mode: bool = True
+        self._entity_paint_frame_idx: Optional[int] = None
+        self._entity_paint_mouse_id: Optional[int] = None
+        self._entity_paint_points: list[tuple[int, int]] = []
+        self._entity_paint_add_radius: int = 8
+        self._entity_paint_erase_radius: int = 4
         self._show_keypoints: bool = False
         # Mutable key→entity mapping (can be customized from settings)
         self._entity_keys: dict[int, int] = dict(_DEFAULT_DIGIT_KEYS)
@@ -166,6 +173,8 @@ class MainWindow(QMainWindow):
         # ── UI ────────────────────────────────────────────────────────────────
         self._build_ui()
         self._connect_signals()
+        self._on_paint_add_size_changed(self.action_bar.paint_add_size())
+        self._on_paint_erase_size_changed(self.action_bar.paint_erase_size())
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -319,6 +328,9 @@ class MainWindow(QMainWindow):
 
         # Action bar
         self.action_bar.segment_requested.connect(self._run_text_prompt)
+        self.action_bar.paint_toggled.connect(self._on_paint_button_toggled)
+        self.action_bar.paint_add_size_changed.connect(self._on_paint_add_size_changed)
+        self.action_bar.paint_erase_size_changed.connect(self._on_paint_erase_size_changed)
         self.action_bar.undo_requested.connect(self._undo_last_sam3_action)
         self.action_bar.redo_requested.connect(self._redo_last_sam3_action)
         self.action_bar.track_requested.connect(self._start_tracking)
@@ -408,6 +420,7 @@ class MainWindow(QMainWindow):
             self._entity_lasso_mouse_id = None
             self._entity_lasso_points.clear()
             self._entity_lasso_add_mode = False
+            self._cancel_entity_paint_mode(rerender=False)
             self.examples_panel.clear_examples()
             self.progress_widget.reset()
 
@@ -449,6 +462,11 @@ class MainWindow(QMainWindow):
                 "Region refine cancelled after changing frame.",
                 rerender=False,
             )
+        if self._entity_paint_mode and frame_idx != self._entity_paint_frame_idx:
+            self._cancel_entity_paint_mode(
+                "Paint mode cancelled after changing frame.",
+                rerender=False,
+            )
         self._current_frame_idx = frame_idx
         self.identity_panel.set_current_frame(frame_idx)
         self._render_frame(frame_idx)
@@ -484,6 +502,8 @@ class MainWindow(QMainWindow):
             composite = self._draw_split_polygon_overlay(composite)
         if self._entity_lasso_active and frame_idx == self._entity_lasso_frame_idx:
             composite = self._draw_entity_lasso_overlay(composite)
+        if self._entity_paint_mode and frame_idx == self._entity_paint_frame_idx:
+            composite = self._draw_entity_paint_overlay(composite)
 
         # ROI overlay
         if self._roi_analyzer.rois:
@@ -604,6 +624,7 @@ class MainWindow(QMainWindow):
         active = (
             not self._split_polygon_active
             and not self._entity_lasso_active
+            and not self._entity_paint_mode
             and
             self._pending_outputs is not None
             and self._current_frame_idx == self._prompt_frame_idx
@@ -612,6 +633,8 @@ class MainWindow(QMainWindow):
         self.viewer.set_assignment_cursor(active)
 
     def _start_entity_lasso_mode(self, mouse_id: int) -> None:
+        if self._entity_paint_mode:
+            self._cancel_entity_paint_mode(rerender=False)
         if self._split_polygon_active:
             self._cancel_split_polygon_mode(rerender=False)
         self._entity_lasso_active = True
@@ -673,6 +696,268 @@ class MainWindow(QMainWindow):
         if not self._video_path:
             return False
         return self.identity_panel.selected_mouse() is not None
+
+    def _can_begin_entity_paint_mode(self) -> bool:
+        if self._video_reader is None:
+            return False
+        if self._pending_outputs is None:
+            return False
+        if self._current_frame_idx != self._prompt_frame_idx:
+            return False
+        return self.identity_panel.selected_mouse() is not None
+
+    def _current_entity_paint_radius(self) -> int:
+        if self._entity_paint_add_mode:
+            return max(1, int(self._entity_paint_add_radius))
+        return max(1, int(self._entity_paint_erase_radius))
+
+    def _on_paint_add_size_changed(self, value: int) -> None:
+        self._entity_paint_add_radius = max(1, int(value))
+        if (
+            self._entity_paint_mode
+            and self._entity_paint_add_mode
+            and self._video_reader is not None
+        ):
+            self._render_frame(self._current_frame_idx)
+
+    def _on_paint_erase_size_changed(self, value: int) -> None:
+        self._entity_paint_erase_radius = max(1, int(value))
+        if (
+            self._entity_paint_mode
+            and (not self._entity_paint_add_mode)
+            and self._video_reader is not None
+        ):
+            self._render_frame(self._current_frame_idx)
+
+    def _start_entity_paint_mode(self, *, add_mode: bool) -> None:
+        if not self._can_begin_entity_paint_mode():
+            self.action_bar.set_paint_mode(False)
+            self.viewer.set_paint_drag_mode(False)
+            self._entity_paint_mode = False
+            self.lbl_status.setText(
+                "Paint mode needs a selected entity on the segmented frame."
+            )
+            return
+        if self._split_polygon_active:
+            self._cancel_split_polygon_mode(rerender=False)
+        if self._entity_lasso_active:
+            self._cancel_entity_lasso_mode(rerender=False)
+        selected_mouse = self.identity_panel.selected_mouse()
+        if selected_mouse is None:
+            return
+        self._entity_paint_mode = True
+        self._entity_paint_add_mode = bool(add_mode)
+        self._entity_paint_frame_idx = self._current_frame_idx
+        self._entity_paint_mouse_id = int(selected_mouse)
+        self._entity_paint_points.clear()
+        self.viewer.set_paint_drag_mode(True)
+        self.action_bar.set_paint_mode(True, add_mode=self._entity_paint_add_mode)
+        self._update_assignment_cursor()
+        self._render_frame(self._current_frame_idx)
+        name = self.identity_panel.entity_name(int(selected_mouse))
+        mode = "add" if self._entity_paint_add_mode else "erase"
+        radius = self._current_entity_paint_radius()
+        self.lbl_status.setText(
+            f"Paint {mode} mode for {name}: drag on frame to apply stroke (size {radius}px)."
+        )
+
+    def _cancel_entity_paint_mode(
+        self,
+        status: Optional[str] = None,
+        *,
+        rerender: bool = False,
+    ) -> None:
+        was_active = self._entity_paint_mode or bool(self._entity_paint_points)
+        self._entity_paint_mode = False
+        self._entity_paint_add_mode = True
+        self._entity_paint_frame_idx = None
+        self._entity_paint_mouse_id = None
+        self._entity_paint_points.clear()
+        self.viewer.set_paint_drag_mode(False)
+        self.action_bar.set_paint_mode(False)
+        self._update_assignment_cursor()
+        if rerender and was_active and self._video_reader is not None:
+            self._render_frame(self._current_frame_idx)
+        if status:
+            self.lbl_status.setText(status)
+
+    def _append_entity_paint_point(
+        self,
+        x: int,
+        y: int,
+        *,
+        min_distance: int = 0,
+    ) -> bool:
+        point = (int(x), int(y))
+        if not self._entity_paint_points:
+            self._entity_paint_points.append(point)
+            return True
+        last_x, last_y = self._entity_paint_points[-1]
+        if min_distance > 0:
+            dx = point[0] - last_x
+            dy = point[1] - last_y
+            if (dx * dx) + (dy * dy) < (min_distance * min_distance):
+                return False
+        elif point == self._entity_paint_points[-1]:
+            return False
+        self._entity_paint_points.append(point)
+        return True
+
+    def _draw_entity_paint_overlay(self, frame: np.ndarray) -> np.ndarray:
+        import cv2
+
+        if (
+            not self._entity_paint_mode
+            or self._entity_paint_frame_idx != self._current_frame_idx
+        ):
+            return frame
+
+        out = frame.copy()
+        radius = self._current_entity_paint_radius()
+        accent = (90, 230, 120) if self._entity_paint_add_mode else (230, 120, 90)
+        points = np.array(self._entity_paint_points, dtype=np.int32)
+        if len(points) >= 2:
+            cv2.polylines(
+                out,
+                [points],
+                isClosed=False,
+                color=accent,
+                thickness=max(2, int(radius * 0.6)),
+            )
+        if len(points) > 0:
+            x, y = self._entity_paint_points[-1]
+            cv2.circle(out, (int(x), int(y)), int(radius), accent, 1)
+            cv2.circle(out, (int(x), int(y)), 3, accent, -1)
+
+        name = ""
+        if self._entity_paint_mouse_id is not None:
+            name = self.identity_panel.entity_name(self._entity_paint_mouse_id)
+        mode_badge = "PAINT +" if self._entity_paint_add_mode else "PAINT -"
+        badge = f"{mode_badge} {name}  size {radius}px  drag to draw  Esc to exit"
+        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        cv2.rectangle(out, (8, 30), (18 + tw, 40 + th), (12, 22, 12), -1)
+        cv2.putText(
+            out,
+            badge,
+            (14, 36 + th),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            accent,
+            1,
+            cv2.LINE_AA,
+        )
+        return out
+
+    def _apply_entity_paint_stroke(self) -> None:
+        import cv2
+
+        if (
+            not self._entity_paint_mode
+            or self._entity_paint_frame_idx != self._current_frame_idx
+            or self._pending_outputs is None
+            or self._video_reader is None
+        ):
+            self._cancel_entity_paint_mode(rerender=False)
+            return
+        if not self._entity_paint_points:
+            return
+        mouse_id = self._entity_paint_mouse_id
+        if mouse_id is None:
+            self._cancel_entity_paint_mode("Select an entity first.", rerender=True)
+            return
+
+        frame_idx = self._current_frame_idx
+        frame_shape = (self._video_reader.info.height, self._video_reader.info.width)
+        sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        mapping = self._identity_mgr.get_full_mapping()
+        target_sid = mapping.get(int(mouse_id))
+        if target_sid is None:
+            if not self._entity_paint_add_mode:
+                self.lbl_status.setText(
+                    "Erase paint needs an assigned entity. Assign it first."
+                )
+                self._entity_paint_points.clear()
+                self._render_frame(frame_idx)
+                return
+            target_sid = self._next_available_sam_id(sam_masks)
+            self._identity_mgr.assign(int(mouse_id), int(target_sid))
+            self.identity_panel.mark_assigned(int(mouse_id), int(target_sid))
+            mapping = self._identity_mgr.get_full_mapping()
+
+        target_sid = int(target_sid)
+        target_mask = np.asarray(sam_masks.get(target_sid, np.zeros(frame_shape, dtype=bool))).astype(bool)
+
+        stroke = np.zeros(frame_shape, dtype=np.uint8)
+        pts = np.array(self._entity_paint_points, dtype=np.int32)
+        radius = self._current_entity_paint_radius()
+        line_radius = max(1, int(round(radius * 0.7)))
+        thickness = max(1, int(line_radius * 2))
+        if len(pts) >= 2:
+            cv2.polylines(stroke, [pts], isClosed=False, color=1, thickness=thickness)
+        for px, py in self._entity_paint_points:
+            cv2.circle(stroke, (int(px), int(py)), int(line_radius), 1, -1)
+        stroke_mask = stroke > 0
+        if not stroke_mask.any():
+            self._entity_paint_points.clear()
+            self._render_frame(frame_idx)
+            return
+
+        if self._entity_paint_add_mode:
+            edited_mask = np.logical_or(target_mask, stroke_mask)
+            changed_px = int(np.logical_and(np.logical_not(target_mask), stroke_mask).sum())
+        else:
+            edited_mask = np.logical_and(target_mask, np.logical_not(stroke_mask))
+            changed_px = int(np.logical_and(target_mask, stroke_mask).sum())
+        if changed_px <= 0:
+            self._entity_paint_points.clear()
+            self._render_frame(frame_idx)
+            self.lbl_status.setText("Paint stroke made no changes.")
+            return
+
+        self._push_sam3_undo(
+            f"paint {'add' if self._entity_paint_add_mode else 'erase'} entity {mouse_id}",
+            frame_idx=frame_idx,
+        )
+
+        stable_sid_masks = {
+            int(sid): np.asarray(mask).astype(bool) for sid, mask in sam_masks.items()
+        }
+        stable_sid_masks[target_sid] = edited_mask
+        nonempty_sid_masks = {sid: m for sid, m in stable_sid_masks.items() if int(m.sum()) > 0}
+
+        self._pending_outputs = self._outputs_from_masks(nonempty_sid_masks)
+        self._prompt_frame_idx = frame_idx
+        self._rejected_masks = {}
+        if edited_mask.any():
+            self._size_validator.record(int(mouse_id), edited_mask)
+
+        display_masks: dict[int, np.ndarray] = {}
+        for mid, sid in mapping.items():
+            sid = int(sid)
+            mask = nonempty_sid_masks.get(sid)
+            if mask is not None:
+                display_masks[int(mid)] = mask
+        self._all_masks[frame_idx] = display_masks
+
+        if mapping and nonempty_sid_masks:
+            self._tracker.initialize(frame_idx, nonempty_sid_masks, mapping)
+
+        prompt = self.action_bar.text_prompt()
+        obj_count = len(self._pending_outputs.get("out_obj_ids", []))
+        self._record_segmentation_example(frame_idx, prompt, obj_count, self._pending_outputs)
+        self._refresh_prompt_assignment_ui(frame_idx, nonempty_sid_masks)
+
+        self._entity_paint_points.clear()
+        self._render_frame(frame_idx)
+        mode_text = "added to" if self._entity_paint_add_mode else "erased from"
+        name = self.identity_panel.entity_name(int(mouse_id))
+        self.lbl_status.setText(f"Paint {mode_text} {name}: {changed_px} px")
+
+    def _on_paint_button_toggled(self, checked: bool) -> None:
+        if checked:
+            self._start_entity_paint_mode(add_mode=True)
+            return
+        self._cancel_entity_paint_mode(rerender=True)
 
     def _draw_entity_lasso_overlay(self, frame: np.ndarray) -> np.ndarray:
         import cv2
@@ -949,6 +1234,8 @@ class MainWindow(QMainWindow):
         freehand: bool = False,
         temporary: bool = False,
     ) -> None:
+        if self._entity_paint_mode:
+            self._cancel_entity_paint_mode(rerender=False)
         if self._entity_lasso_active:
             self._cancel_entity_lasso_mode(rerender=False)
         self._split_polygon_active = True
@@ -1305,6 +1592,10 @@ class MainWindow(QMainWindow):
         if not self._video_path:
             QMessageBox.warning(self, "No Video", "Please load a video first.")
             return
+        if self._entity_paint_mode:
+            self.lbl_status.setText("Exit paint mode (Esc) before running Segment.")
+            return
+        self._cancel_entity_paint_mode(rerender=False)
         self._cancel_split_polygon_mode(rerender=False)
         self._cancel_entity_lasso_mode(rerender=False)
 
@@ -1822,6 +2113,29 @@ class MainWindow(QMainWindow):
         self._start_split_polygon_mode()
 
     def _on_viewer_lasso_started(self, x: int, y: int) -> None:
+        if self._entity_paint_mode:
+            if (
+                self._entity_paint_frame_idx != self._current_frame_idx
+                or not self._can_begin_entity_paint_mode()
+            ):
+                self._cancel_entity_paint_mode(
+                    "Paint mode cancelled.",
+                    rerender=True,
+                )
+                return
+            selected_mouse = self.identity_panel.selected_mouse()
+            if selected_mouse is None:
+                self._cancel_entity_paint_mode("Select an entity first.", rerender=True)
+                return
+            self._entity_paint_mouse_id = int(selected_mouse)
+            self._entity_paint_points.clear()
+            self._append_entity_paint_point(x, y)
+            self._render_frame(self._current_frame_idx)
+            mode = "add" if self._entity_paint_add_mode else "erase"
+            name = self.identity_panel.entity_name(int(selected_mouse))
+            self.lbl_status.setText(f"Paint {mode} stroke on {name}...")
+            return
+
         if (not self._split_polygon_active) and self._can_begin_entity_lasso_refine():
             selected_mouse = self.identity_panel.selected_mouse()
             if selected_mouse is not None:
@@ -1863,6 +2177,14 @@ class MainWindow(QMainWindow):
 
     def _on_viewer_lasso_moved(self, x: int, y: int) -> None:
         if (
+            self._entity_paint_mode
+            and self._entity_paint_frame_idx == self._current_frame_idx
+        ):
+            if self._append_entity_paint_point(x, y, min_distance=1):
+                self._render_frame(self._current_frame_idx)
+            return
+
+        if (
             self._entity_lasso_active
             and self._entity_lasso_frame_idx == self._current_frame_idx
         ):
@@ -1881,6 +2203,14 @@ class MainWindow(QMainWindow):
             self._render_frame(self._current_frame_idx)
 
     def _on_viewer_lasso_finished(self, x: int, y: int) -> None:
+        if (
+            self._entity_paint_mode
+            and self._entity_paint_frame_idx == self._current_frame_idx
+        ):
+            self._append_entity_paint_point(x, y, min_distance=1)
+            self._apply_entity_paint_stroke()
+            return
+
         if (
             self._entity_lasso_active
             and self._entity_lasso_frame_idx == self._current_frame_idx
@@ -2573,6 +2903,12 @@ class MainWindow(QMainWindow):
             self._cancel_split_polygon_mode("Split mode cancelled.")
         elif key == int(Qt.Key_Escape) and self._entity_lasso_active:
             self._cancel_entity_lasso_mode("Region refine cancelled.")
+        elif key == int(Qt.Key_Escape) and self._entity_paint_mode:
+            self._cancel_entity_paint_mode("Paint mode cancelled.", rerender=True)
+        elif key == int(Qt.Key_P) and not event.isAutoRepeat():
+            self._start_entity_paint_mode(add_mode=True)
+        elif key == int(Qt.Key_C) and not event.isAutoRepeat():
+            self._start_entity_paint_mode(add_mode=False)
         elif (
             (event.modifiers() & Qt.ControlModifier)
             and key in (int(Qt.Key_Plus), int(Qt.Key_Equal))
@@ -2599,7 +2935,10 @@ class MainWindow(QMainWindow):
         elif key == int(Qt.Key_Left):
             self._step_frame(-1)
         elif key == int(Qt.Key_S) and not event.isAutoRepeat():
-            self._run_text_prompt()
+            if self._entity_paint_mode:
+                self.lbl_status.setText("Exit paint mode (Esc) before running Segment.")
+            else:
+                self._run_text_prompt()
         else:
             super().keyPressEvent(event)
 

@@ -128,7 +128,7 @@ MIN_MOUSE_AREA_PIXELS = 500   # reject masks smaller than this
 MAX_MOUSE_AREA_FRACTION = 0.3  # reject masks larger than this fraction of frame
 
 # ── Mask overlay ──────────────────────────────────────────────────────────────
-MASK_ALPHA = 0.4  # opacity of mask overlay (0=transparent, 1=opaque)
+MASK_ALPHA = 0.32  # opacity of mask overlay (0=transparent, 1=opaque)
 
 # ── Viewer update rate during tracking ───────────────────────────────────────
 VIEWER_UPDATE_EVERY_N_FRAMES = 30
