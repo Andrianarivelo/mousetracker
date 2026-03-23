@@ -1084,8 +1084,10 @@ class MainWindow(QMainWindow):
             logger.exception("Region refine setup failed: %s", error)
             return
 
-        obj_hint = self._identity_mgr.sam_id_for_mouse(mouse_id)
-        if obj_hint is None and current_masks:
+        add_mode = bool(self._entity_lasso_add_mode)
+        # Detect mode should start from a fresh obj_id so SAM focuses on the drawn region.
+        obj_hint: Optional[int] = self._identity_mgr.sam_id_for_mouse(mouse_id) if add_mode else None
+        if obj_hint is None and add_mode and current_masks:
             best_sid = None
             best_overlap = 0
             for sid, mask in current_masks.items():
@@ -1104,11 +1106,10 @@ class MainWindow(QMainWindow):
         prompt_obj_id = int(obj_hint)
         mapping_before = self._identity_mgr.get_full_mapping()
         selected_sid_existing = mapping_before.get(int(mouse_id))
-        hint_owner_mouse = self._identity_mgr.mouse_id_for_sam(prompt_obj_id)
+        hint_owner_mouse = self._identity_mgr.mouse_id_for_sam(prompt_obj_id) if add_mode else None
 
         self._push_sam3_undo(f"region refine entity {mouse_id}", frame_idx=frame_idx)
 
-        add_mode = bool(self._entity_lasso_add_mode)
         base_mask = (
             current_masks.get(int(selected_sid_existing))
             if selected_sid_existing is not None
@@ -1124,13 +1125,21 @@ class MainWindow(QMainWindow):
                 "No valid prompt points in the selected region.",
             )
             return
-        raw_outputs = self._engine.add_point_prompt(
-            0,
-            points,
-            point_labels,
-            obj_id=prompt_obj_id,
-            frame_shape=frame_shape,
-        )
+        try:
+            raw_outputs = self._engine.add_point_prompt(
+                0,
+                points,
+                point_labels,
+                obj_id=prompt_obj_id,
+                frame_shape=frame_shape,
+            )
+        except Exception as error:
+            self.progress_widget.set_determinate()
+            self.progress_widget.reset("Region refine failed")
+            self._cancel_entity_lasso_mode("Region refine failed.")
+            QMessageBox.critical(self, "Segmentation Error", str(error))
+            logger.exception("Region refine prompt failed: %s", error)
+            return
 
         # Keep only one detected object from the selected region for this mouse.
         sam_masks_raw = self._engine.outputs_to_masks(raw_outputs, frame_shape)
