@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from app.config import (
     AUTO_PROMPTS,
     DEFAULT_TEXT_PROMPT,
+    MASK_ALPHA,
     MAX_MICE,
 )
 
@@ -216,10 +217,31 @@ class ActionBar(QWidget):
         self.spin_frame_skip.setToolTip("Process every Nth frame (1=all)")
         row2.addWidget(self.spin_frame_skip)
 
+        self.chk_show_masks = QCheckBox("Mask")
+        self.chk_show_masks.setChecked(True)
+        self.chk_show_masks.setToolTip("Show/hide segmentation masks")
+        row2.addWidget(self.chk_show_masks)
+
+        row2.addWidget(QLabel("Opacity:"))
+        self.spin_mask_alpha = QSpinBox()
+        self.spin_mask_alpha.setRange(5, 90)
+        self.spin_mask_alpha.setValue(int(round(MASK_ALPHA * 100)))
+        self.spin_mask_alpha.setSingleStep(5)
+        self.spin_mask_alpha.setSuffix("%")
+        self.spin_mask_alpha.setFixedWidth(64)
+        self.spin_mask_alpha.setToolTip("Mask overlay opacity")
+        row2.addWidget(self.spin_mask_alpha)
+        self.chk_show_masks.toggled.connect(self.spin_mask_alpha.setEnabled)
+
         self.chk_show_labels = QCheckBox("ID")
         self.chk_show_labels.setChecked(True)
         self.chk_show_labels.setToolTip("Draw entity name + confidence")
         row2.addWidget(self.chk_show_labels)
+
+        self.chk_show_names = QCheckBox("Names")
+        self.chk_show_names.setChecked(True)
+        self.chk_show_names.setToolTip("Use custom mouse names in labels")
+        row2.addWidget(self.chk_show_names)
 
         self.chk_show_bbox = QCheckBox("BBox")
         self.chk_show_bbox.setChecked(False)
@@ -374,6 +396,12 @@ class ActionBar(QWidget):
 
     def paint_erase_size(self) -> int:
         return int(self.spin_paint_erase.value())
+
+    def masks_visible(self) -> bool:
+        return bool(self.chk_show_masks.isChecked())
+
+    def mask_alpha(self) -> float:
+        return max(0.05, min(0.90, float(self.spin_mask_alpha.value()) / 100.0))
 
     def set_tracking(self, active: bool) -> None:
         self._tracking_active = bool(active)

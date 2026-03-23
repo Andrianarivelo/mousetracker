@@ -40,7 +40,6 @@ _DEFAULT_DIGIT_KEYS: dict[int, int] = {
 
 from app.config import (
     IDENTITY_COLORS,
-    MASK_ALPHA,
     VIEWER_UPDATE_EVERY_N_FRAMES,
     WINDOW_HEIGHT,
     WINDOW_WIDTH,
@@ -351,7 +350,16 @@ class MainWindow(QMainWindow):
         self.viewer.crop_drawn.connect(self._on_viewer_crop_drawn)
 
         # Repaint when overlay checkboxes toggle
+        self.action_bar.chk_show_masks.stateChanged.connect(
+            lambda: self._render_frame(self._current_frame_idx)
+        )
+        self.action_bar.spin_mask_alpha.valueChanged.connect(
+            lambda: self._render_frame(self._current_frame_idx)
+        )
         self.action_bar.chk_show_labels.stateChanged.connect(
+            lambda: self._render_frame(self._current_frame_idx)
+        )
+        self.action_bar.chk_show_names.stateChanged.connect(
             lambda: self._render_frame(self._current_frame_idx)
         )
         self.action_bar.chk_show_bbox.stateChanged.connect(
@@ -485,8 +493,13 @@ class MainWindow(QMainWindow):
 
         # Mask overlay (fall back to nearest earlier tracked frame when frame_skip > 1)
         masks = self._nearest_masks(frame_idx)
-        if masks:
-            composite = compose_mask_overlay(composite, masks, IDENTITY_COLORS, MASK_ALPHA)
+        if masks and self.action_bar.masks_visible():
+            composite = compose_mask_overlay(
+                composite,
+                masks,
+                IDENTITY_COLORS,
+                self.action_bar.mask_alpha(),
+            )
 
         # Rejected masks — faint red overlay, only shown on the active prompt frame
         if frame_idx == self._prompt_frame_idx and self._rejected_masks:
@@ -523,10 +536,13 @@ class MainWindow(QMainWindow):
         if self.action_bar.chk_show_labels.isChecked():
             state = self._tracker.get_state_at(frame_idx)
             if state and state.centroids:
-                names = {
-                    eid: self.identity_panel.entity_name(eid)
-                    for eid in state.centroids
-                }
+                if self.action_bar.chk_show_names.isChecked():
+                    names = {
+                        eid: self.identity_panel.entity_name(eid)
+                        for eid in state.centroids
+                    }
+                else:
+                    names = None
                 active_entity_id = None
                 if (
                     frame_idx == self._prompt_frame_idx
