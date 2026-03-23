@@ -2590,7 +2590,9 @@ class MainWindow(QMainWindow):
         self._update_example_assignment_note(frame_idx, len(sam_masks))
 
         next_unassigned = self._next_unassigned_entity_id()
-        if next_unassigned is not None:
+        if self._entity_paint_mode and self._entity_paint_mouse_id is not None:
+            self.identity_panel.select_entity(int(self._entity_paint_mouse_id))
+        elif next_unassigned is not None:
             self.identity_panel.select_entity(next_unassigned)
 
         self._update_assignment_cursor()
