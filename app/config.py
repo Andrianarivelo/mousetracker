@@ -12,8 +12,8 @@ ICONS_DIR = RESOURCES_DIR / "icons"
 # ── SAM3 model checkpoint ─────────────────────────────────────────────────────
 # Local checkpoint paths — set these to your downloaded model files.
 # If both are None, build_sam3_video_predictor will try to download from HF.
-SAM3_CHECKPOINT_PATH: str = r"C:\sam3_pt\sam3.pt"
-SAM3_SAFETENSORS_PATH: str = r"C:\sam3_pt\sam3.pt"
+SAM3_CHECKPOINT_PATH: str = r"D:\Models\sam3_pt\sam3.pt"
+SAM3_SAFETENSORS_PATH: str = r"D:\Models\sam3_pt\sam3.safetensors"
 
 def get_sam3_checkpoint() -> str | None:
     """Return the best available local checkpoint path."""
