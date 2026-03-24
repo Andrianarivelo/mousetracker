@@ -54,3 +54,12 @@ app/workers/__pycache__/fine_tune_worker.cpython-312.pyc
 app/workers/__pycache__/preprocessing_worker.cpython-312.pyc
 app/workers/__pycache__/tracking_worker.cpython-312.pyc
 app/workers/__pycache__/tracking_worker.cpython-313.pyc
+
+# Generic Python artifacts
+__pycache__/
+*.py[cod]
+
+# Local model files (never commit large checkpoints)
+weights/
+checkpoints/
+sam3-weights/

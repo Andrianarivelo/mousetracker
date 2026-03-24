@@ -32,11 +32,15 @@ class _CropViewBox(pg.ViewBox):
         self._crop_start: Optional[tuple[int, int]] = None
         self._just_drew = False  # suppress click-through after second corner
         self._lasso_drag_active = False
+        self._force_lasso_drag = False
 
     def set_crop_mode(self, enabled: bool) -> None:
         self._crop_mode = enabled
         self._crop_start = None
         self._just_drew = False
+
+    def set_lasso_force_drag(self, enabled: bool) -> None:
+        self._force_lasso_drag = bool(enabled)
 
     def mousePressEvent(self, ev):
         if not self._crop_mode or ev.button() != Qt.LeftButton:
@@ -64,7 +68,7 @@ class _CropViewBox(pg.ViewBox):
             super().mouseDragEvent(ev, axis=axis)
             return
 
-        ctrl_down = bool(ev.modifiers() & Qt.ControlModifier)
+        ctrl_down = bool(ev.modifiers() & Qt.ControlModifier) or self._force_lasso_drag
         if ev.isStart():
             self._lasso_drag_active = ctrl_down
         elif not self._lasso_drag_active:
@@ -196,6 +200,10 @@ class VideoViewer(QWidget):
         self._view_box.set_crop_mode(False)
         if self._crop_rect is None:
             self._crop_roi.setVisible(False)
+
+    def set_paint_drag_mode(self, enabled: bool) -> None:
+        """Allow lasso drag without Ctrl while paint mode is active."""
+        self._view_box.set_lasso_force_drag(bool(enabled))
 
     def set_crop_rect(self, x: int, y: int, w: int, h: int) -> None:
         """Show a persistent crop-rect overlay (driven by spinbox values)."""

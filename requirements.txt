@@ -26,3 +26,5 @@ h5py>=3.10
 
 # ── Video preprocessing ────────────────────────────────────────────────────
 # ffmpeg must be installed separately (e.g. conda install ffmpeg)
+
+omegaconf>=2.3

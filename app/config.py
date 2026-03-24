@@ -10,19 +10,69 @@ RESOURCES_DIR = ROOT_DIR / "resources"
 ICONS_DIR = RESOURCES_DIR / "icons"
 
 # ── SAM3 model checkpoint ─────────────────────────────────────────────────────
-# Local checkpoint paths — set these to your downloaded model files.
-# If both are None, build_sam3_video_predictor will try to download from HF.
-SAM3_CHECKPOINT_PATH: str = r"C:\sam3_pt\sam3.pt"
-SAM3_SAFETENSORS_PATH: str = r"C:\sam3_pt\sam3.pt"
+# Resolution order:
+#   1) Runtime override selected by the user in-app
+#   2) Env vars SAM3_CHECKPOINT_PATH / SAM3_SAFETENSORS_PATH
+#   3) Original git defaults (C:\sam3_pt\...)
+#   4) Local D: fallback (D:\Analysis\sam3-weights\...)
+#
+# If no local file is found, the model builder may attempt HuggingFace.
+SAM3_CHECKPOINT_PATH: str = os.environ.get("SAM3_CHECKPOINT_PATH", "").strip()
+SAM3_SAFETENSORS_PATH: str = os.environ.get("SAM3_SAFETENSORS_PATH", "").strip()
+
+_RUNTIME_SAM3_CHECKPOINT_PATH: str = ""
+
+GIT_DEFAULT_SAM3_PT = Path(r"C:\sam3_pt\sam3.pt")
+GIT_DEFAULT_SAM3_SAFETENSORS = Path(r"C:\sam3_pt\sam3.safetensors")
+
+D_FALLBACK_SAM3_PT = Path(r"D:\Analysis\sam3-weights\sam3.pt")
+D_FALLBACK_SAM3_SAFETENSORS = Path(r"D:\Analysis\sam3-weights\sam3.safetensors")
+
+
+def _sam3_checkpoint_candidates() -> list[Path]:
+    """Ordered list of possible local checkpoint files."""
+    candidates: list[Path] = []
+
+    # Runtime selection in GUI wins.
+    if _RUNTIME_SAM3_CHECKPOINT_PATH:
+        candidates.append(Path(_RUNTIME_SAM3_CHECKPOINT_PATH).expanduser())
+
+    # Explicit env-var paths win.
+    if SAM3_CHECKPOINT_PATH:
+        candidates.append(Path(SAM3_CHECKPOINT_PATH).expanduser())
+    if SAM3_SAFETENSORS_PATH:
+        candidates.append(Path(SAM3_SAFETENSORS_PATH).expanduser())
+
+    # Original git defaults.
+    candidates.extend(
+        [
+            GIT_DEFAULT_SAM3_PT,
+            GIT_DEFAULT_SAM3_SAFETENSORS,
+        ]
+    )
+
+    # D: fallback.
+    candidates.extend(
+        [
+            D_FALLBACK_SAM3_PT,
+            D_FALLBACK_SAM3_SAFETENSORS,
+        ]
+    )
+    return candidates
+
+
+def set_runtime_sam3_checkpoint(path: str | None) -> None:
+    """Set or clear the runtime checkpoint override selected by the user."""
+    global _RUNTIME_SAM3_CHECKPOINT_PATH
+    _RUNTIME_SAM3_CHECKPOINT_PATH = str(path or "").strip()
+
 
 def get_sam3_checkpoint() -> str | None:
-    """Return the best available local checkpoint path."""
-    # Prefer .pt checkpoint; fall back to safetensors if missing
-    if SAM3_CHECKPOINT_PATH and Path(SAM3_CHECKPOINT_PATH).exists():
-        return SAM3_CHECKPOINT_PATH
-    if SAM3_SAFETENSORS_PATH and Path(SAM3_SAFETENSORS_PATH).exists():
-        return SAM3_SAFETENSORS_PATH
-    return None  # let the builder try HuggingFace
+    """Return the first existing local SAM3 checkpoint path, if any."""
+    for candidate in _sam3_checkpoint_candidates():
+        if candidate.exists():
+            return str(candidate.resolve())
+    return None
 
 # ── Identity colors (R, G, B) ─────────────────────────────────────────────────
 IDENTITY_COLORS: dict[int, tuple[int, int, int]] = {
@@ -78,7 +128,7 @@ MIN_MOUSE_AREA_PIXELS = 500   # reject masks smaller than this
 MAX_MOUSE_AREA_FRACTION = 0.3  # reject masks larger than this fraction of frame
 
 # ── Mask overlay ──────────────────────────────────────────────────────────────
-MASK_ALPHA = 0.4  # opacity of mask overlay (0=transparent, 1=opaque)
+MASK_ALPHA = 0.32  # opacity of mask overlay (0=transparent, 1=opaque)
 
 # ── Viewer update rate during tracking ───────────────────────────────────────
 VIEWER_UPDATE_EVERY_N_FRAMES = 30
