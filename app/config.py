@@ -1,5 +1,6 @@
 """App-wide settings, paths, and defaults for MouseTracker Pro."""
 
+import colorsys
 import os
 from pathlib import Path
 
@@ -103,6 +104,23 @@ IDENTITY_NAMES: dict[int, str] = {
 }
 
 MAX_MICE = 6
+
+
+def identity_color_rgb(entity_id: int) -> tuple[int, int, int]:
+    """Return the (R, G, B) color for *any* entity ID — deterministic."""
+    if entity_id in IDENTITY_COLORS:
+        return IDENTITY_COLORS[entity_id]
+    hue = (entity_id * 0.618033988749895) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.80, 0.90)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def identity_color_hex(entity_id: int) -> str:
+    """Return the hex color string for *any* entity ID — deterministic."""
+    if entity_id in IDENTITY_COLORS_HEX:
+        return IDENTITY_COLORS_HEX[entity_id]
+    r, g, b = identity_color_rgb(entity_id)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 # ── SAM3 defaults ─────────────────────────────────────────────────────────────
 DEFAULT_TEXT_PROMPT = "separate dark animal on clear bedding"

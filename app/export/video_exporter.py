@@ -6,7 +6,7 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from app.config import IDENTITY_COLORS, IDENTITY_NAMES
+from app.config import IDENTITY_COLORS, IDENTITY_NAMES, identity_color_rgb
 from app.core.video_io import compose_mask_overlay, draw_bboxes, draw_keypoints
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ def export_video(
     progress_callback: Optional[Callable[[int], None]] = None,
     start_frame: int = 0,
     end_frame: int = -1,
+    entity_colors: Optional[dict[int, tuple[int, int, int]]] = None,
 ) -> str:
     """
     Render original video with overlays and write to output_path.
@@ -38,6 +39,15 @@ def export_video(
     # Build frame_idx → state lookup, plus sorted list for nearest-frame fallback
     state_map = {s.frame_idx: s for s in tracker_history}
     _tracked_frames = sorted(state_map.keys())
+
+    # Collect all entity IDs seen in tracking history and build color map
+    all_eids: set[int] = set()
+    for s in tracker_history:
+        if s.masks:
+            all_eids.update(s.masks.keys())
+    colors = entity_colors or {}
+    _id_colors = {eid: colors.get(eid, identity_color_rgb(eid)) for eid in all_eids}
+    _id_colors.update(colors)  # include any extra panel-provided entries
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -79,15 +89,15 @@ def export_video(
             if state:
                 if draw_masks and state.masks:
                     composite = compose_mask_overlay(
-                        composite, state.masks, IDENTITY_COLORS, mask_alpha
+                        composite, state.masks, _id_colors, mask_alpha
                     )
                 if draw_bbox and state.bboxes:
                     labels = {mid: IDENTITY_NAMES.get(mid, f"M{mid}") for mid in state.bboxes}
-                    composite = draw_bboxes(composite, state.bboxes, IDENTITY_COLORS, labels)
+                    composite = draw_bboxes(composite, state.bboxes, _id_colors, labels)
                 if draw_labels and state.centroids:
                     for mid, (cx, cy) in state.centroids.items():
                         label = IDENTITY_NAMES.get(mid, f"M{mid}")
-                        color = IDENTITY_COLORS.get(mid, (255, 255, 255))
+                        color = _id_colors.get(mid, identity_color_rgb(mid))
                         bgr = (color[2], color[1], color[0])
                         cv2.putText(
                             composite, label,
@@ -97,7 +107,7 @@ def export_video(
                 if draw_kps and keypoints_by_frame:
                     fkps = keypoints_by_frame.get(frame_idx, {})
                     if fkps:
-                        composite = draw_keypoints(composite, fkps, IDENTITY_COLORS)
+                        composite = draw_keypoints(composite, fkps, _id_colors)
 
             writer.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
             frame_idx += 1

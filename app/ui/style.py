@@ -1,6 +1,6 @@
 """QSS dark theme for MouseTracker Pro."""
 
-from app.config import IDENTITY_COLORS_HEX
+from app.config import IDENTITY_COLORS_HEX, identity_color_hex
 
 DARK_THEME_QSS = """
 QMainWindow {
@@ -291,13 +291,13 @@ QDialog {
 
 def get_identity_label_style(mouse_id: int) -> str:
     """Return a QSS style string for an identity label."""
-    color = IDENTITY_COLORS_HEX.get(mouse_id, "#ffffff")
+    color = identity_color_hex(mouse_id)
     return f"color: {color}; font-weight: bold;"
 
 
 def get_mouse_button_style(mouse_id: int, selected: bool = False) -> str:
     """Return style for a mouse identity selection button."""
-    color = IDENTITY_COLORS_HEX.get(mouse_id, "#ffffff")
+    color = identity_color_hex(mouse_id)
     if selected:
         return (
             f"background: {color}; color: #1e1e2e; border: 2px solid white; "

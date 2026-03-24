@@ -39,10 +39,10 @@ _DEFAULT_DIGIT_KEYS: dict[int, int] = {
 }
 
 from app.config import (
-    IDENTITY_COLORS,
     VIEWER_UPDATE_EVERY_N_FRAMES,
     WINDOW_HEIGHT,
     WINDOW_WIDTH,
+    identity_color_rgb,
 )
 from app.core.identity_manager import IdentityManager
 from app.core.keypoint_estimator import KeypointEstimator, estimate_all_frames
@@ -491,13 +491,18 @@ class MainWindow(QMainWindow):
 
         composite = frame.copy()
 
+        # Build dynamic color map from identity panel (matches label colors exactly)
+        id_colors = self.identity_panel.get_identity_colors()
+
         # Mask overlay (fall back to nearest earlier tracked frame when frame_skip > 1)
         masks = self._nearest_masks(frame_idx)
         if masks and self.action_bar.masks_visible():
+            # Ensure every mask entity has a color entry
+            _colors = {eid: id_colors.get(eid, identity_color_rgb(eid)) for eid in masks}
             composite = compose_mask_overlay(
                 composite,
                 masks,
-                IDENTITY_COLORS,
+                _colors,
                 self.action_bar.mask_alpha(),
             )
 
@@ -528,7 +533,7 @@ class MainWindow(QMainWindow):
             fkps = self._keypoints_by_frame.get(frame_idx)
             if fkps:
                 composite = draw_keypoints(
-                    composite, fkps, IDENTITY_COLORS,
+                    composite, fkps, id_colors,
                     keypoint_colors=KEYPOINT_COLORS, show_labels=True,
                 )
 
@@ -555,7 +560,7 @@ class MainWindow(QMainWindow):
                     active_entity_id = self.identity_panel.selected_mouse()
                 composite = draw_entity_labels(
                     composite, state.centroids, state.confidences,
-                    IDENTITY_COLORS, names,
+                    id_colors, names,
                     active_entity_id=active_entity_id,
                 )
 
@@ -563,7 +568,7 @@ class MainWindow(QMainWindow):
         if self.action_bar.chk_show_bbox.isChecked():
             state = self._tracker.get_state_at(frame_idx)
             if state and state.bboxes:
-                composite = draw_bboxes(composite, state.bboxes, IDENTITY_COLORS)
+                composite = draw_bboxes(composite, state.bboxes, id_colors)
 
         self.viewer.display_frame(composite)
 
@@ -3353,6 +3358,7 @@ class MainWindow(QMainWindow):
             keypoints_by_frame=self._keypoints_by_frame or None,
             progress_callback=progress_callback,
             start_frame=start_f, end_frame=end_f,
+            entity_colors=self.identity_panel.get_identity_colors(),
         )
 
     def _on_export_finished(self, success: bool, result: str) -> None:

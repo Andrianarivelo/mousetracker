@@ -1,10 +1,10 @@
 """Dynamic entity (mouse / object) identity assignment panel."""
 
-import colorsys
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QObject, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -18,17 +18,106 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config import IDENTITY_COLORS_HEX, MAX_MICE
+from app.config import MAX_MICE, identity_color_hex, identity_color_rgb
 
 logger = logging.getLogger(__name__)
 
 
 def _color_hex_for(entity_id: int) -> str:
-    if entity_id in IDENTITY_COLORS_HEX:
-        return IDENTITY_COLORS_HEX[entity_id]
-    hue = (entity_id * 0.618033988749895) % 1.0
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.80, 0.90)
-    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+    return identity_color_hex(entity_id)
+
+
+def _make_icon(painter_fn, size: int = 18) -> QIcon:
+    """Create a QIcon by painting onto a transparent pixmap."""
+    pix = QPixmap(size, size)
+    pix.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter_fn(p, size)
+    p.end()
+    return QIcon(pix)
+
+
+def _icon_rename(size: int = 18) -> QIcon:
+    """Pencil icon."""
+    def _draw(p: QPainter, s: int) -> None:
+        pen = QPen(QColor("#cdd6f4"), 1.6)
+        pen.setCapStyle(pen.capStyle().RoundCap)
+        p.setPen(pen)
+        # pencil body (diagonal line)
+        p.drawLine(4, s - 5, s - 5, 4)
+        # pencil tip
+        p.drawLine(3, s - 4, 4, s - 5)
+        # small nib mark
+        p.drawLine(s - 5, 4, s - 3, 2)
+    return _make_icon(_draw, size)
+
+
+def _icon_clear(size: int = 18) -> QIcon:
+    """Eraser / undo-arrow icon."""
+    def _draw(p: QPainter, s: int) -> None:
+        pen = QPen(QColor("#f9e2af"), 1.6)
+        pen.setCapStyle(pen.capStyle().RoundCap)
+        pen.setJoinStyle(pen.joinStyle().RoundJoin)
+        p.setPen(pen)
+        # circular arrow (undo)
+        from PySide6.QtCore import QPointF
+        cx, cy, r = s / 2, s / 2, s * 0.34
+        # arc approximation with lines
+        import math
+        pts = []
+        for deg in range(-30, 260, 15):
+            rad = math.radians(deg)
+            pts.append(QPointF(cx + r * math.cos(rad), cy - r * math.sin(rad)))
+        for i in range(len(pts) - 1):
+            p.drawLine(pts[i], pts[i + 1])
+        # arrowhead at the end
+        end = pts[-1]
+        p.drawLine(end, QPointF(end.x() - 3, end.y() - 2))
+        p.drawLine(end, QPointF(end.x() + 1, end.y() - 3))
+    return _make_icon(_draw, size)
+
+
+def _icon_remove(size: int = 18) -> QIcon:
+    """Trash-can icon."""
+    def _draw(p: QPainter, s: int) -> None:
+        pen = QPen(QColor("#f38ba8"), 1.4)
+        pen.setCapStyle(pen.capStyle().RoundCap)
+        pen.setJoinStyle(pen.joinStyle().RoundJoin)
+        p.setPen(pen)
+        # lid
+        p.drawLine(3, 5, s - 3, 5)
+        # handle on lid
+        p.drawLine(7, 5, 7, 3)
+        p.drawLine(7, 3, s - 7, 3)
+        p.drawLine(s - 7, 3, s - 7, 5)
+        # body
+        p.drawLine(4, 5, 5, s - 3)
+        p.drawLine(5, s - 3, s - 5, s - 3)
+        p.drawLine(s - 5, s - 3, s - 4, 5)
+        # vertical lines inside
+        mid = s // 2
+        p.drawLine(mid, 7, mid, s - 5)
+        p.drawLine(mid - 2, 7, mid - 2, s - 5)
+        p.drawLine(mid + 2, 7, mid + 2, s - 5)
+    return _make_icon(_draw, size)
+
+
+def _icon_flag(size: int = 18) -> QIcon:
+    """Pin/target icon for frame marking."""
+    def _draw(p: QPainter, s: int) -> None:
+        pen = QPen(QColor("#89dceb"), 1.5)
+        pen.setCapStyle(pen.capStyle().RoundCap)
+        p.setPen(pen)
+        # crosshair circle
+        cx, cy, r = s / 2, s / 2, s * 0.3
+        p.drawEllipse(QRect(int(cx - r), int(cy - r), int(2 * r), int(2 * r)))
+        # crosshair lines
+        p.drawLine(int(cx), 2, int(cx), int(cy - r - 1))
+        p.drawLine(int(cx), int(cy + r + 1), int(cx), s - 2)
+        p.drawLine(2, int(cy), int(cx - r - 1), int(cy))
+        p.drawLine(int(cx + r + 1), int(cy), s - 2, int(cy))
+    return _make_icon(_draw, size)
 
 
 class IdentityPanel(QWidget):
@@ -78,7 +167,7 @@ class IdentityPanel(QWidget):
         layout.addWidget(lbl_title)
 
         lbl_hint = QLabel(
-            "Click ● or name to select for assignment. ✎ renames."
+            "Click dot or name to select. Use icons to rename, clear, or remove."
         )
         lbl_hint.setWordWrap(True)
         lbl_hint.setStyleSheet("color: #6c7086; font-size: 11px;")
@@ -146,8 +235,10 @@ class IdentityPanel(QWidget):
         self.spin_swap_from.setValue(0)
         self.spin_swap_from.setMaximumWidth(80)
         from_row.addWidget(self.spin_swap_from)
-        btn_flag_from = QPushButton("⚑")
-        btn_flag_from.setFixedWidth(28)
+        btn_flag_from = QPushButton()
+        btn_flag_from.setFixedSize(28, 24)
+        btn_flag_from.setIcon(_icon_flag())
+        btn_flag_from.setIconSize(QSize(16, 16))
         btn_flag_from.setObjectName("secondary_button")
         btn_flag_from.setToolTip("Set From frame to current timeline position")
         btn_flag_from.clicked.connect(
@@ -165,8 +256,10 @@ class IdentityPanel(QWidget):
         self.spin_swap_to.setValue(999999)
         self.spin_swap_to.setMaximumWidth(80)
         to_row.addWidget(self.spin_swap_to)
-        btn_flag_to = QPushButton("⚑")
-        btn_flag_to.setFixedWidth(28)
+        btn_flag_to = QPushButton()
+        btn_flag_to.setFixedSize(28, 24)
+        btn_flag_to.setIcon(_icon_flag())
+        btn_flag_to.setIconSize(QSize(16, 16))
         btn_flag_to.setObjectName("secondary_button")
         btn_flag_to.setToolTip("Set To frame to current timeline position")
         btn_flag_to.clicked.connect(
@@ -237,8 +330,10 @@ class IdentityPanel(QWidget):
         btn_name.installEventFilter(self)
         row_layout.addWidget(btn_name, stretch=1)
 
-        btn_rename = QPushButton("✎")
-        btn_rename.setFixedWidth(24)
+        btn_rename = QPushButton()
+        btn_rename.setFixedSize(24, 24)
+        btn_rename.setIcon(_icon_rename())
+        btn_rename.setIconSize(QSize(16, 16))
         btn_rename.setObjectName("secondary_button")
         btn_rename.setToolTip("Rename this entity")
         btn_rename.clicked.connect(lambda _checked, e=eid: self._rename_entity(e))
@@ -256,15 +351,19 @@ class IdentityPanel(QWidget):
         )
         row_layout.addWidget(lbl_det)
 
-        btn_clear = QPushButton("✕")
-        btn_clear.setFixedWidth(24)
+        btn_clear = QPushButton()
+        btn_clear.setFixedSize(24, 24)
+        btn_clear.setIcon(_icon_clear())
+        btn_clear.setIconSize(QSize(16, 16))
         btn_clear.setObjectName("secondary_button")
         btn_clear.setToolTip("Clear mask assignment (keep entity)")
         btn_clear.clicked.connect(lambda _checked, e=eid: self._clear_assignment(e))
         row_layout.addWidget(btn_clear)
 
-        btn_remove = QPushButton("−")
-        btn_remove.setFixedWidth(24)
+        btn_remove = QPushButton()
+        btn_remove.setFixedSize(24, 24)
+        btn_remove.setIcon(_icon_remove())
+        btn_remove.setIconSize(QSize(16, 16))
         btn_remove.setObjectName("secondary_button")
         btn_remove.setToolTip("Remove this entity")
         btn_remove.clicked.connect(lambda _checked, e=eid: self._remove_entity(e))
@@ -463,6 +562,10 @@ class IdentityPanel(QWidget):
 
     def entity_count(self) -> int:
         return len(self._entities)
+
+    def get_identity_colors(self) -> dict[int, tuple[int, int, int]]:
+        """Return {entity_id: (R, G, B)} for every current entity."""
+        return {eid: identity_color_rgb(eid) for eid in self._entities}
 
     def entity_name(self, entity_id: int) -> str:
         entity = self._entities.get(entity_id)
