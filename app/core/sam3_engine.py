@@ -40,7 +40,18 @@ class SAM3Engine:
             logger.info("No local checkpoint found — will attempt HuggingFace download")
         from sam3.model_builder import build_sam3_video_predictor
         # Passing checkpoint_path prevents HuggingFace download (see model_builder.py)
-        self.predictor = build_sam3_video_predictor(checkpoint_path=ckpt)
+        try:
+            self.predictor = build_sam3_video_predictor(checkpoint_path=ckpt)
+        except Exception as error:
+            if ckpt is None:
+                raise RuntimeError(
+                    "No local SAM3 checkpoint found.\n"
+                    "Expected order: C:\\sam3_pt\\sam3.pt, then "
+                    "D:\\Analysis\\sam3-weights\\sam3.pt, then user selection.\n"
+                    "You can also set SAM3_CHECKPOINT_PATH before launching.\n"
+                    f"Original error: {error}"
+                ) from error
+            raise
         self._loaded = True
         logger.info("SAM3 model loaded.")
 

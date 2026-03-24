@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from app.config import (
     AUTO_PROMPTS,
     DEFAULT_TEXT_PROMPT,
+    MASK_ALPHA,
     MAX_MICE,
 )
 
@@ -34,6 +35,11 @@ class ActionBar(QWidget):
     """Compact two-row action bar with prompt, segment/track, and export controls."""
 
     segment_requested = Signal()
+    paint_toggled = Signal(bool)
+    paint_add_size_changed = Signal(int)
+    paint_erase_size_changed = Signal(int)
+    undo_requested = Signal()
+    redo_requested = Signal()
     track_requested = Signal()
     free_track_requested = Signal()
     stop_requested = Signal()
@@ -45,7 +51,10 @@ class ActionBar(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._tracking_active = False
+        self._paint_mode_active = False
         self._setup_ui()
+        self._sync_paint_controls()
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -114,6 +123,58 @@ class ActionBar(QWidget):
         self.btn_segment.clicked.connect(self.segment_requested)
         row1.addWidget(self.btn_segment)
 
+        self.btn_undo = QPushButton("Undo (Ctrl+Z)")
+        self.btn_undo.setFixedHeight(24)
+        self.btn_undo.setObjectName("secondary_button")
+        self.btn_undo.setToolTip("Undo the last SAM3 edit on the current frame")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.clicked.connect(self.undo_requested)
+        row1.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("Redo (Ctrl+Y)")
+        self.btn_redo.setFixedHeight(24)
+        self.btn_redo.setObjectName("secondary_button")
+        self.btn_redo.setToolTip("Redo the last undone SAM3 edit on the current frame")
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.clicked.connect(self.redo_requested)
+        row1.addWidget(self.btn_redo)
+
+        self.btn_paint = QPushButton("Paint [P]")
+        self.btn_paint.setFixedHeight(24)
+        self.btn_paint.setObjectName("secondary_button")
+        self.btn_paint.setCheckable(True)
+        self.btn_paint.setToolTip(
+            "Toggle paint mode for selected entity. P=paint add, C=paint erase."
+        )
+        self.btn_paint.toggled.connect(self.paint_toggled)
+        row1.addWidget(self.btn_paint)
+
+        self.lbl_paint_add = QLabel("+")
+        self.lbl_paint_add.setToolTip("Paint add brush size (pixels)")
+        row1.addWidget(self.lbl_paint_add)
+
+        self.spin_paint_add = QSpinBox()
+        self.spin_paint_add.setRange(1, 80)
+        self.spin_paint_add.setValue(8)
+        self.spin_paint_add.setFixedWidth(54)
+        self.spin_paint_add.setSuffix(" px")
+        self.spin_paint_add.setToolTip("Paint add brush size (pixels)")
+        self.spin_paint_add.valueChanged.connect(self.paint_add_size_changed)
+        row1.addWidget(self.spin_paint_add)
+
+        self.lbl_paint_erase = QLabel("-")
+        self.lbl_paint_erase.setToolTip("Paint erase brush size (pixels)")
+        row1.addWidget(self.lbl_paint_erase)
+
+        self.spin_paint_erase = QSpinBox()
+        self.spin_paint_erase.setRange(1, 80)
+        self.spin_paint_erase.setValue(4)
+        self.spin_paint_erase.setFixedWidth(54)
+        self.spin_paint_erase.setSuffix(" px")
+        self.spin_paint_erase.setToolTip("Paint erase brush size (pixels)")
+        self.spin_paint_erase.valueChanged.connect(self.paint_erase_size_changed)
+        row1.addWidget(self.spin_paint_erase)
+
         self.btn_track = QPushButton("▶ Track")
         self.btn_track.setFixedHeight(24)
         self.btn_track.setToolTip("Propagate tracking through the video")
@@ -156,10 +217,31 @@ class ActionBar(QWidget):
         self.spin_frame_skip.setToolTip("Process every Nth frame (1=all)")
         row2.addWidget(self.spin_frame_skip)
 
+        self.chk_show_masks = QCheckBox("Mask")
+        self.chk_show_masks.setChecked(True)
+        self.chk_show_masks.setToolTip("Show/hide segmentation masks")
+        row2.addWidget(self.chk_show_masks)
+
+        row2.addWidget(QLabel("Opacity:"))
+        self.spin_mask_alpha = QSpinBox()
+        self.spin_mask_alpha.setRange(5, 90)
+        self.spin_mask_alpha.setValue(int(round(MASK_ALPHA * 100)))
+        self.spin_mask_alpha.setSingleStep(5)
+        self.spin_mask_alpha.setSuffix("%")
+        self.spin_mask_alpha.setFixedWidth(64)
+        self.spin_mask_alpha.setToolTip("Mask overlay opacity")
+        row2.addWidget(self.spin_mask_alpha)
+        self.chk_show_masks.toggled.connect(self.spin_mask_alpha.setEnabled)
+
         self.chk_show_labels = QCheckBox("ID")
         self.chk_show_labels.setChecked(True)
         self.chk_show_labels.setToolTip("Draw entity name + confidence")
         row2.addWidget(self.chk_show_labels)
+
+        self.chk_show_names = QCheckBox("Names")
+        self.chk_show_names.setChecked(True)
+        self.chk_show_names.setToolTip("Use custom mouse names in labels")
+        row2.addWidget(self.chk_show_names)
 
         self.chk_show_bbox = QCheckBox("BBox")
         self.chk_show_bbox.setChecked(False)
@@ -309,11 +391,54 @@ class ActionBar(QWidget):
         self.spin_tw_start.setMaximum(duration_s)
         self.spin_tw_end.setValue(duration_s)
 
+    def paint_add_size(self) -> int:
+        return int(self.spin_paint_add.value())
+
+    def paint_erase_size(self) -> int:
+        return int(self.spin_paint_erase.value())
+
+    def masks_visible(self) -> bool:
+        return bool(self.chk_show_masks.isChecked())
+
+    def mask_alpha(self) -> float:
+        return max(0.05, min(0.90, float(self.spin_mask_alpha.value()) / 100.0))
+
     def set_tracking(self, active: bool) -> None:
-        self.btn_track.setEnabled(not active)
-        self.btn_free_track.setEnabled(not active)
-        self.btn_stop.setEnabled(active)
-        self.btn_segment.setEnabled(not active)
+        self._tracking_active = bool(active)
+        self.btn_track.setEnabled(not self._tracking_active)
+        self.btn_free_track.setEnabled(not self._tracking_active)
+        self.btn_stop.setEnabled(self._tracking_active)
+        self._sync_paint_controls()
+
+    def set_undo_redo_enabled(self, can_undo: bool, can_redo: bool) -> None:
+        self.btn_undo.setEnabled(bool(can_undo))
+        self.btn_redo.setEnabled(bool(can_redo))
+
+    def set_paint_mode(self, active: bool, *, add_mode: bool = True) -> None:
+        self._paint_mode_active = bool(active)
+        self.btn_paint.blockSignals(True)
+        self.btn_paint.setChecked(bool(active))
+        self.btn_paint.blockSignals(False)
+        if not active:
+            self.btn_paint.setText("Paint [P]")
+        else:
+            self.btn_paint.setText("Paint + [P]" if add_mode else "Paint - [C]")
+        self._sync_paint_controls()
+
+    def _sync_paint_controls(self) -> None:
+        can_segment = (not self._tracking_active) and (not self._paint_mode_active)
+        self.btn_segment.setEnabled(can_segment)
+        self.btn_paint.setEnabled(not self._tracking_active)
+        show_paint_tools = self._paint_mode_active
+        paint_widgets = (
+            self.lbl_paint_add,
+            self.spin_paint_add,
+            self.lbl_paint_erase,
+            self.spin_paint_erase,
+        )
+        for widget in paint_widgets:
+            widget.setVisible(show_paint_tools)
+            widget.setEnabled(show_paint_tools and (not self._tracking_active))
 
     def get_shortcut_names(self) -> dict[int, str]:
         return {

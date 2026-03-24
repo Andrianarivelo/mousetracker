@@ -1,5 +1,6 @@
 """MainWindow with docked layout for MouseTracker Pro."""
 
+import copy
 import logging
 import re
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QPixmap
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -39,7 +40,6 @@ _DEFAULT_DIGIT_KEYS: dict[int, int] = {
 
 from app.config import (
     IDENTITY_COLORS,
-    MASK_ALPHA,
     VIEWER_UPDATE_EVERY_N_FRAMES,
     WINDOW_HEIGHT,
     WINDOW_WIDTH,
@@ -140,11 +140,25 @@ class MainWindow(QMainWindow):
         self._rejected_masks: dict[int, np.ndarray] = {}  # SAM obj IDs rejected by filter
         self._prompt_points: list[tuple[int, int, int]] = []  # (x, y, label) refinement clicks
         self._segmentation_examples: dict[int, dict] = {}  # {frame_idx: {"prompt": str, "obj_count": int}}
+        self._sam3_undo_by_frame: dict[int, list[dict]] = {}
+        self._sam3_redo_by_frame: dict[int, list[dict]] = {}
         self._split_polygon_active: bool = False
         self._split_polygon_frame_idx: Optional[int] = None
         self._split_polygon_points: list[tuple[int, int]] = []
         self._split_polygon_freehand: bool = False
         self._split_polygon_temporary: bool = False
+        self._entity_lasso_active: bool = False
+        self._entity_lasso_frame_idx: Optional[int] = None
+        self._entity_lasso_mouse_id: Optional[int] = None
+        self._entity_lasso_points: list[tuple[int, int]] = []
+        self._entity_lasso_add_mode: bool = False
+        self._entity_paint_mode: bool = False
+        self._entity_paint_add_mode: bool = True
+        self._entity_paint_frame_idx: Optional[int] = None
+        self._entity_paint_mouse_id: Optional[int] = None
+        self._entity_paint_points: list[tuple[int, int]] = []
+        self._entity_paint_add_radius: int = 8
+        self._entity_paint_erase_radius: int = 4
         self._show_keypoints: bool = False
         # Mutable key→entity mapping (can be customized from settings)
         self._entity_keys: dict[int, int] = dict(_DEFAULT_DIGIT_KEYS)
@@ -158,12 +172,15 @@ class MainWindow(QMainWindow):
         # ── UI ────────────────────────────────────────────────────────────────
         self._build_ui()
         self._connect_signals()
+        self._on_paint_add_size_changed(self.action_bar.paint_add_size())
+        self._on_paint_erase_size_changed(self.action_bar.paint_erase_size())
 
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.lbl_status = QLabel("Ready — load a video to begin")
         self.status_bar.addWidget(self.lbl_status)
+        self._update_undo_redo_state()
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -310,6 +327,11 @@ class MainWindow(QMainWindow):
 
         # Action bar
         self.action_bar.segment_requested.connect(self._run_text_prompt)
+        self.action_bar.paint_toggled.connect(self._on_paint_button_toggled)
+        self.action_bar.paint_add_size_changed.connect(self._on_paint_add_size_changed)
+        self.action_bar.paint_erase_size_changed.connect(self._on_paint_erase_size_changed)
+        self.action_bar.undo_requested.connect(self._undo_last_sam3_action)
+        self.action_bar.redo_requested.connect(self._redo_last_sam3_action)
         self.action_bar.track_requested.connect(self._start_tracking)
         self.action_bar.free_track_requested.connect(self._start_free_track)
         self.action_bar.stop_requested.connect(self._stop_tracking)
@@ -328,7 +350,16 @@ class MainWindow(QMainWindow):
         self.viewer.crop_drawn.connect(self._on_viewer_crop_drawn)
 
         # Repaint when overlay checkboxes toggle
+        self.action_bar.chk_show_masks.stateChanged.connect(
+            lambda: self._render_frame(self._current_frame_idx)
+        )
+        self.action_bar.spin_mask_alpha.valueChanged.connect(
+            lambda: self._render_frame(self._current_frame_idx)
+        )
         self.action_bar.chk_show_labels.stateChanged.connect(
+            lambda: self._render_frame(self._current_frame_idx)
+        )
+        self.action_bar.chk_show_names.stateChanged.connect(
             lambda: self._render_frame(self._current_frame_idx)
         )
         self.action_bar.chk_show_bbox.stateChanged.connect(
@@ -390,11 +421,20 @@ class MainWindow(QMainWindow):
             self._rejected_masks = {}
             self._prompt_points.clear()
             self._segmentation_examples.clear()
+            self._sam3_undo_by_frame.clear()
+            self._sam3_redo_by_frame.clear()
+            self._entity_lasso_active = False
+            self._entity_lasso_frame_idx = None
+            self._entity_lasso_mouse_id = None
+            self._entity_lasso_points.clear()
+            self._entity_lasso_add_mode = False
+            self._cancel_entity_paint_mode(rerender=False)
             self.examples_panel.clear_examples()
             self.progress_widget.reset()
 
             self.lbl_status.setText(f"Loaded: {info.name}")
             logger.info(f"Video loaded: {path}")
+            self._update_undo_redo_state()
 
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to load video:\n{e}")
@@ -425,10 +465,21 @@ class MainWindow(QMainWindow):
                 "Split mode cancelled after changing frame.",
                 rerender=False,
             )
+        if self._entity_lasso_active and frame_idx != self._entity_lasso_frame_idx:
+            self._cancel_entity_lasso_mode(
+                "Region refine cancelled after changing frame.",
+                rerender=False,
+            )
+        if self._entity_paint_mode and frame_idx != self._entity_paint_frame_idx:
+            self._cancel_entity_paint_mode(
+                "Paint mode cancelled after changing frame.",
+                rerender=False,
+            )
         self._current_frame_idx = frame_idx
         self.identity_panel.set_current_frame(frame_idx)
         self._render_frame(frame_idx)
         self._update_assignment_cursor()
+        self._update_undo_redo_state()
 
     def _render_frame(self, frame_idx: int) -> None:
         """Read and display a frame with all overlays."""
@@ -442,8 +493,13 @@ class MainWindow(QMainWindow):
 
         # Mask overlay (fall back to nearest earlier tracked frame when frame_skip > 1)
         masks = self._nearest_masks(frame_idx)
-        if masks:
-            composite = compose_mask_overlay(composite, masks, IDENTITY_COLORS, MASK_ALPHA)
+        if masks and self.action_bar.masks_visible():
+            composite = compose_mask_overlay(
+                composite,
+                masks,
+                IDENTITY_COLORS,
+                self.action_bar.mask_alpha(),
+            )
 
         # Rejected masks — faint red overlay, only shown on the active prompt frame
         if frame_idx == self._prompt_frame_idx and self._rejected_masks:
@@ -457,6 +513,10 @@ class MainWindow(QMainWindow):
 
         if self._split_polygon_active and frame_idx == self._split_polygon_frame_idx:
             composite = self._draw_split_polygon_overlay(composite)
+        if self._entity_lasso_active and frame_idx == self._entity_lasso_frame_idx:
+            composite = self._draw_entity_lasso_overlay(composite)
+        if self._entity_paint_mode and frame_idx == self._entity_paint_frame_idx:
+            composite = self._draw_entity_paint_overlay(composite)
 
         # ROI overlay
         if self._roi_analyzer.rois:
@@ -476,12 +536,22 @@ class MainWindow(QMainWindow):
         if self.action_bar.chk_show_labels.isChecked():
             state = self._tracker.get_state_at(frame_idx)
             if state and state.centroids:
-                names = {
-                    eid: self.identity_panel.entity_name(eid)
-                    for eid in state.centroids
-                }
+                if self.action_bar.chk_show_names.isChecked():
+                    names = {
+                        eid: self.identity_panel.entity_name(eid)
+                        for eid in state.centroids
+                    }
+                else:
+                    names = None
                 active_entity_id = None
-                if frame_idx == self._prompt_frame_idx and self._pending_outputs is not None:
+                if (
+                    frame_idx == self._prompt_frame_idx
+                    and self._pending_outputs is not None
+                    and not (
+                        self._entity_lasso_active
+                        and frame_idx == self._entity_lasso_frame_idx
+                    )
+                ):
                     active_entity_id = self.identity_panel.selected_mouse()
                 composite = draw_entity_labels(
                     composite, state.centroids, state.confidences,
@@ -569,6 +639,8 @@ class MainWindow(QMainWindow):
         """Show crosshair on the viewer when click-to-assign is active."""
         active = (
             not self._split_polygon_active
+            and not self._entity_lasso_active
+            and not self._entity_paint_mode
             and
             self._pending_outputs is not None
             and self._current_frame_idx == self._prompt_frame_idx
@@ -576,12 +648,655 @@ class MainWindow(QMainWindow):
         )
         self.viewer.set_assignment_cursor(active)
 
+    def _start_entity_lasso_mode(self, mouse_id: int) -> None:
+        if self._entity_paint_mode:
+            self._cancel_entity_paint_mode(rerender=False)
+        if self._split_polygon_active:
+            self._cancel_split_polygon_mode(rerender=False)
+        self._entity_lasso_active = True
+        self._entity_lasso_frame_idx = self._current_frame_idx
+        self._entity_lasso_mouse_id = int(mouse_id)
+        self._entity_lasso_points.clear()
+        self._update_assignment_cursor()
+        self._render_frame(self._current_frame_idx)
+        name = self.identity_panel.entity_name(int(mouse_id))
+        mode = "add" if self._entity_lasso_add_mode else "detect"
+        self.lbl_status.setText(
+            f"Region {mode}: hold Ctrl and drag around {name}, release to apply."
+        )
+
+    def _cancel_entity_lasso_mode(
+        self,
+        status: Optional[str] = None,
+        rerender: bool = True,
+    ) -> None:
+        was_active = self._entity_lasso_active or bool(self._entity_lasso_points)
+        self._entity_lasso_active = False
+        self._entity_lasso_frame_idx = None
+        self._entity_lasso_mouse_id = None
+        self._entity_lasso_points.clear()
+        self._entity_lasso_add_mode = False
+        self._update_assignment_cursor()
+        if rerender and was_active and self._video_reader is not None:
+            self._render_frame(self._current_frame_idx)
+        if status:
+            self.lbl_status.setText(status)
+
+    def _append_entity_lasso_point(
+        self,
+        x: int,
+        y: int,
+        *,
+        min_distance: int = 0,
+    ) -> bool:
+        point = (int(x), int(y))
+        if not self._entity_lasso_points:
+            self._entity_lasso_points.append(point)
+            return True
+
+        last_x, last_y = self._entity_lasso_points[-1]
+        if min_distance > 0:
+            dx = point[0] - last_x
+            dy = point[1] - last_y
+            if (dx * dx) + (dy * dy) < (min_distance * min_distance):
+                return False
+        elif point == self._entity_lasso_points[-1]:
+            return False
+
+        self._entity_lasso_points.append(point)
+        return True
+
+    def _can_begin_entity_lasso_refine(self) -> bool:
+        if self._video_reader is None:
+            return False
+        if not self._video_path:
+            return False
+        return self.identity_panel.selected_mouse() is not None
+
+    def _can_begin_entity_paint_mode(self) -> bool:
+        if self._video_reader is None:
+            return False
+        if self._pending_outputs is None:
+            return False
+        if self._current_frame_idx != self._prompt_frame_idx:
+            return False
+        return self.identity_panel.selected_mouse() is not None
+
+    def _current_entity_paint_radius(self) -> int:
+        if self._entity_paint_add_mode:
+            return max(1, int(self._entity_paint_add_radius))
+        return max(1, int(self._entity_paint_erase_radius))
+
+    def _on_paint_add_size_changed(self, value: int) -> None:
+        self._entity_paint_add_radius = max(1, int(value))
+        if (
+            self._entity_paint_mode
+            and self._entity_paint_add_mode
+            and self._video_reader is not None
+        ):
+            self._render_frame(self._current_frame_idx)
+
+    def _on_paint_erase_size_changed(self, value: int) -> None:
+        self._entity_paint_erase_radius = max(1, int(value))
+        if (
+            self._entity_paint_mode
+            and (not self._entity_paint_add_mode)
+            and self._video_reader is not None
+        ):
+            self._render_frame(self._current_frame_idx)
+
+    def _start_entity_paint_mode(self, *, add_mode: bool) -> None:
+        if not self._can_begin_entity_paint_mode():
+            self.action_bar.set_paint_mode(False)
+            self.viewer.set_paint_drag_mode(False)
+            self._entity_paint_mode = False
+            self.lbl_status.setText(
+                "Paint mode needs a selected entity on the segmented frame."
+            )
+            return
+        if self._split_polygon_active:
+            self._cancel_split_polygon_mode(rerender=False)
+        if self._entity_lasso_active:
+            self._cancel_entity_lasso_mode(rerender=False)
+        selected_mouse = self.identity_panel.selected_mouse()
+        if selected_mouse is None:
+            return
+        self._entity_paint_mode = True
+        self._entity_paint_add_mode = bool(add_mode)
+        self._entity_paint_frame_idx = self._current_frame_idx
+        self._entity_paint_mouse_id = int(selected_mouse)
+        self._entity_paint_points.clear()
+        self.viewer.set_paint_drag_mode(True)
+        self.action_bar.set_paint_mode(True, add_mode=self._entity_paint_add_mode)
+        self._update_assignment_cursor()
+        self._render_frame(self._current_frame_idx)
+        name = self.identity_panel.entity_name(int(selected_mouse))
+        mode = "add" if self._entity_paint_add_mode else "erase"
+        radius = self._current_entity_paint_radius()
+        self.lbl_status.setText(
+            f"Paint {mode} mode for {name}: drag on frame to apply stroke (size {radius}px)."
+        )
+
+    def _cancel_entity_paint_mode(
+        self,
+        status: Optional[str] = None,
+        *,
+        rerender: bool = False,
+    ) -> None:
+        was_active = self._entity_paint_mode or bool(self._entity_paint_points)
+        self._entity_paint_mode = False
+        self._entity_paint_add_mode = True
+        self._entity_paint_frame_idx = None
+        self._entity_paint_mouse_id = None
+        self._entity_paint_points.clear()
+        self.viewer.set_paint_drag_mode(False)
+        self.action_bar.set_paint_mode(False)
+        self._update_assignment_cursor()
+        if rerender and was_active and self._video_reader is not None:
+            self._render_frame(self._current_frame_idx)
+        if status:
+            self.lbl_status.setText(status)
+
+    def _append_entity_paint_point(
+        self,
+        x: int,
+        y: int,
+        *,
+        min_distance: int = 0,
+    ) -> bool:
+        point = (int(x), int(y))
+        if not self._entity_paint_points:
+            self._entity_paint_points.append(point)
+            return True
+        last_x, last_y = self._entity_paint_points[-1]
+        if min_distance > 0:
+            dx = point[0] - last_x
+            dy = point[1] - last_y
+            if (dx * dx) + (dy * dy) < (min_distance * min_distance):
+                return False
+        elif point == self._entity_paint_points[-1]:
+            return False
+        self._entity_paint_points.append(point)
+        return True
+
+    def _draw_entity_paint_overlay(self, frame: np.ndarray) -> np.ndarray:
+        import cv2
+
+        if (
+            not self._entity_paint_mode
+            or self._entity_paint_frame_idx != self._current_frame_idx
+        ):
+            return frame
+
+        out = frame.copy()
+        radius = self._current_entity_paint_radius()
+        accent = (90, 230, 120) if self._entity_paint_add_mode else (230, 120, 90)
+        points = np.array(self._entity_paint_points, dtype=np.int32)
+        if len(points) >= 2:
+            cv2.polylines(
+                out,
+                [points],
+                isClosed=False,
+                color=accent,
+                thickness=max(2, int(radius * 0.6)),
+            )
+        if len(points) > 0:
+            x, y = self._entity_paint_points[-1]
+            cv2.circle(out, (int(x), int(y)), int(radius), accent, 1)
+            cv2.circle(out, (int(x), int(y)), 3, accent, -1)
+
+        name = ""
+        if self._entity_paint_mouse_id is not None:
+            name = self.identity_panel.entity_name(self._entity_paint_mouse_id)
+        mode_badge = "PAINT +" if self._entity_paint_add_mode else "PAINT -"
+        badge = f"{mode_badge} {name}  size {radius}px  drag to draw  Esc to exit"
+        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        cv2.rectangle(out, (8, 30), (18 + tw, 40 + th), (12, 22, 12), -1)
+        cv2.putText(
+            out,
+            badge,
+            (14, 36 + th),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            accent,
+            1,
+            cv2.LINE_AA,
+        )
+        return out
+
+    def _apply_entity_paint_stroke(self) -> None:
+        import cv2
+
+        if (
+            not self._entity_paint_mode
+            or self._entity_paint_frame_idx != self._current_frame_idx
+            or self._pending_outputs is None
+            or self._video_reader is None
+        ):
+            self._cancel_entity_paint_mode(rerender=False)
+            return
+        if not self._entity_paint_points:
+            return
+        mouse_id = self._entity_paint_mouse_id
+        if mouse_id is None:
+            self._cancel_entity_paint_mode("Select an entity first.", rerender=True)
+            return
+
+        frame_idx = self._current_frame_idx
+        frame_shape = (self._video_reader.info.height, self._video_reader.info.width)
+        sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        mapping = self._identity_mgr.get_full_mapping()
+        target_sid = mapping.get(int(mouse_id))
+        if target_sid is None:
+            if not self._entity_paint_add_mode:
+                self.lbl_status.setText(
+                    "Erase paint needs an assigned entity. Assign it first."
+                )
+                self._entity_paint_points.clear()
+                self._render_frame(frame_idx)
+                return
+            target_sid = self._next_available_sam_id(sam_masks)
+            self._identity_mgr.assign(int(mouse_id), int(target_sid))
+            self.identity_panel.mark_assigned(int(mouse_id), int(target_sid))
+            mapping = self._identity_mgr.get_full_mapping()
+
+        target_sid = int(target_sid)
+        target_mask = np.asarray(sam_masks.get(target_sid, np.zeros(frame_shape, dtype=bool))).astype(bool)
+
+        stroke = np.zeros(frame_shape, dtype=np.uint8)
+        pts = np.array(self._entity_paint_points, dtype=np.int32)
+        radius = self._current_entity_paint_radius()
+        line_radius = max(1, int(round(radius * 0.7)))
+        thickness = max(1, int(line_radius * 2))
+        if len(pts) >= 2:
+            cv2.polylines(stroke, [pts], isClosed=False, color=1, thickness=thickness)
+        for px, py in self._entity_paint_points:
+            cv2.circle(stroke, (int(px), int(py)), int(line_radius), 1, -1)
+        stroke_mask = stroke > 0
+        if not stroke_mask.any():
+            self._entity_paint_points.clear()
+            self._render_frame(frame_idx)
+            return
+
+        if self._entity_paint_add_mode:
+            edited_mask = np.logical_or(target_mask, stroke_mask)
+            changed_px = int(np.logical_and(np.logical_not(target_mask), stroke_mask).sum())
+        else:
+            edited_mask = np.logical_and(target_mask, np.logical_not(stroke_mask))
+            changed_px = int(np.logical_and(target_mask, stroke_mask).sum())
+        if changed_px <= 0:
+            self._entity_paint_points.clear()
+            self._render_frame(frame_idx)
+            self.lbl_status.setText("Paint stroke made no changes.")
+            return
+
+        self._push_sam3_undo(
+            f"paint {'add' if self._entity_paint_add_mode else 'erase'} entity {mouse_id}",
+            frame_idx=frame_idx,
+        )
+
+        stable_sid_masks = {
+            int(sid): np.asarray(mask).astype(bool) for sid, mask in sam_masks.items()
+        }
+        stable_sid_masks[target_sid] = edited_mask
+        nonempty_sid_masks = {sid: m for sid, m in stable_sid_masks.items() if int(m.sum()) > 0}
+
+        self._pending_outputs = self._outputs_from_masks(nonempty_sid_masks)
+        self._prompt_frame_idx = frame_idx
+        self._rejected_masks = {}
+        if edited_mask.any():
+            self._size_validator.record(int(mouse_id), edited_mask)
+
+        display_masks: dict[int, np.ndarray] = {}
+        for mid, sid in mapping.items():
+            sid = int(sid)
+            mask = nonempty_sid_masks.get(sid)
+            if mask is not None:
+                display_masks[int(mid)] = mask
+        self._all_masks[frame_idx] = display_masks
+
+        if mapping and nonempty_sid_masks:
+            self._tracker.initialize(frame_idx, nonempty_sid_masks, mapping)
+
+        prompt = self.action_bar.text_prompt()
+        obj_count = len(self._pending_outputs.get("out_obj_ids", []))
+        self._record_segmentation_example(frame_idx, prompt, obj_count, self._pending_outputs)
+        self._refresh_prompt_assignment_ui(frame_idx, nonempty_sid_masks)
+
+        self._entity_paint_points.clear()
+        self._render_frame(frame_idx)
+        mode_text = "added to" if self._entity_paint_add_mode else "erased from"
+        name = self.identity_panel.entity_name(int(mouse_id))
+        self.lbl_status.setText(f"Paint {mode_text} {name}: {changed_px} px")
+
+    def _on_paint_button_toggled(self, checked: bool) -> None:
+        if checked:
+            self._start_entity_paint_mode(add_mode=True)
+            return
+        self._cancel_entity_paint_mode(rerender=True)
+
+    def _draw_entity_lasso_overlay(self, frame: np.ndarray) -> np.ndarray:
+        import cv2
+
+        if (
+            not self._entity_lasso_active
+            or self._entity_lasso_frame_idx != self._current_frame_idx
+        ):
+            return frame
+
+        out = frame.copy()
+        points = np.array(self._entity_lasso_points, dtype=np.int32)
+        accent = (120, 220, 120)
+
+        if len(points) >= 3:
+            overlay = out.copy()
+            cv2.fillPoly(overlay, [points], accent)
+            cv2.addWeighted(overlay, 0.16, out, 0.84, 0, out)
+
+        if len(points) >= 2:
+            cv2.polylines(out, [points], isClosed=False, color=accent, thickness=2)
+
+        if len(self._entity_lasso_points) > 0:
+            x, y = self._entity_lasso_points[-1]
+            cv2.circle(out, (int(x), int(y)), 4, accent, -1)
+            cv2.circle(out, (int(x), int(y)), 6, (12, 24, 12), 1)
+
+        entity_name = ""
+        if self._entity_lasso_mouse_id is not None:
+            entity_name = self.identity_panel.entity_name(self._entity_lasso_mouse_id)
+        mode_badge = "+ADD " if self._entity_lasso_add_mode else ""
+        badge = f"{mode_badge}REFINE {entity_name}  Ctrl+drag region  release to apply".strip()
+        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        cv2.rectangle(out, (8, 30), (18 + tw, 40 + th), (10, 22, 10), -1)
+        cv2.putText(
+            out,
+            badge,
+            (14, 36 + th),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            accent,
+            1,
+            cv2.LINE_AA,
+        )
+        return out
+
+    def _apply_entity_lasso_refine(self) -> None:
+        import cv2
+
+        if (
+            not self._entity_lasso_active
+            or self._entity_lasso_frame_idx != self._current_frame_idx
+            or self._video_reader is None
+        ):
+            self._cancel_entity_lasso_mode()
+            return
+
+        mouse_id = self._entity_lasso_mouse_id
+        if mouse_id is None:
+            self._cancel_entity_lasso_mode("Select an entity first.")
+            return
+
+        if len(self._entity_lasso_points) < 3:
+            self._cancel_entity_lasso_mode(
+                "Region refine cancelled. Hold Ctrl and drag a larger outline."
+            )
+            return
+
+        frame_idx = self._current_frame_idx
+        info = self._video_reader.info
+        frame_shape = (info.height, info.width)
+        polygon = np.array(self._entity_lasso_points, dtype=np.int32)
+        region_mask = np.zeros(frame_shape, dtype=np.uint8)
+        cv2.fillPoly(region_mask, [polygon], 1)
+        region_mask = region_mask.astype(bool)
+        if int(region_mask.sum()) < 20:
+            self._cancel_entity_lasso_mode(
+                "Region refine cancelled. Draw a larger region."
+            )
+            return
+
+        previous_outputs = (
+            self._pending_outputs
+            if self._prompt_frame_idx == frame_idx and self._pending_outputs is not None
+            else None
+        )
+        if previous_outputs is None:
+            example_entry = self._segmentation_examples.get(frame_idx)
+            if example_entry is not None and "outputs" in example_entry:
+                previous_outputs = self._clone_outputs(example_entry.get("outputs"))
+
+        current_masks: dict[int, np.ndarray] = {}
+        if previous_outputs is not None:
+            current_masks, _ = self._to_filtered_masks(previous_outputs, frame_shape)
+
+        try:
+            if not self._engine.is_loaded():
+                self.progress_widget.set_indeterminate("Loading SAM3 model…")
+                self._engine.load_model()
+
+            need_new_session = (
+                self._engine.session_id is None
+                or self._prompt_frame_idx != frame_idx
+            )
+            if need_new_session:
+                self._engine.start_session_on_frame(self._video_path, frame_idx)
+                self._prompt_frame_idx = frame_idx
+                self._prompt_points.clear()
+
+                # Re-seed existing masks so region refinement keeps context.
+                for sid, mask in current_masks.items():
+                    self._engine.add_mask_prompt(
+                        0,
+                        mask,
+                        int(sid),
+                        frame_shape=frame_shape,
+                    )
+            self.progress_widget.set_determinate()
+        except Exception as error:
+            self.progress_widget.set_determinate()
+            self.progress_widget.reset("Region refine failed")
+            self._cancel_entity_lasso_mode()
+            QMessageBox.critical(self, "Segmentation Error", str(error))
+            logger.exception("Region refine setup failed: %s", error)
+            return
+
+        add_mode = bool(self._entity_lasso_add_mode)
+        # Detect mode should start from a fresh obj_id so SAM focuses on the drawn region.
+        obj_hint: Optional[int] = self._identity_mgr.sam_id_for_mouse(mouse_id) if add_mode else None
+        if obj_hint is None and add_mode and current_masks:
+            best_sid = None
+            best_overlap = 0
+            for sid, mask in current_masks.items():
+                overlap = int(np.logical_and(mask, region_mask).sum())
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_sid = int(sid)
+            if best_sid is not None and best_overlap > 0:
+                obj_hint = best_sid
+
+        # SAM3 in this environment requires obj_id for prompt refinement.
+        # If the selected entity has no SAM object yet, create a new ID.
+        if obj_hint is None:
+            obj_hint = self._next_available_sam_id(current_masks)
+
+        prompt_obj_id = int(obj_hint)
+        mapping_before = self._identity_mgr.get_full_mapping()
+        selected_sid_existing = mapping_before.get(int(mouse_id))
+        hint_owner_mouse = self._identity_mgr.mouse_id_for_sam(prompt_obj_id) if add_mode else None
+
+        self._push_sam3_undo(f"region refine entity {mouse_id}", frame_idx=frame_idx)
+
+        base_mask = (
+            current_masks.get(int(selected_sid_existing))
+            if selected_sid_existing is not None
+            else None
+        )
+        points, point_labels = self._sample_region_prompt_points(
+            region_mask,
+            positive_count=3 if add_mode else 1,
+            negative_count=3 if add_mode else 8,
+        )
+        if not points:
+            self._cancel_entity_lasso_mode(
+                "No valid prompt points in the selected region.",
+            )
+            return
+        try:
+            raw_outputs = self._engine.add_point_prompt(
+                0,
+                points,
+                point_labels,
+                obj_id=prompt_obj_id,
+                frame_shape=frame_shape,
+            )
+        except Exception as error:
+            self.progress_widget.set_determinate()
+            self.progress_widget.reset("Region refine failed")
+            self._cancel_entity_lasso_mode("Region refine failed.")
+            QMessageBox.critical(self, "Segmentation Error", str(error))
+            logger.exception("Region refine prompt failed: %s", error)
+            return
+
+        # Keep only one detected object from the selected region for this mouse.
+        sam_masks_raw = self._engine.outputs_to_masks(raw_outputs, frame_shape)
+        best_sid: Optional[int] = None
+        best_score = -1.0
+        best_overlap = 0
+        region_area = max(1, int(region_mask.sum()))
+        if prompt_obj_id in sam_masks_raw:
+            hinted_mask = sam_masks_raw[int(prompt_obj_id)]
+            hinted_overlap = int(np.logical_and(hinted_mask, region_mask).sum())
+            if hinted_overlap > 0:
+                hinted_area = max(1, int(hinted_mask.sum()))
+                best_sid = int(prompt_obj_id)
+                best_overlap = hinted_overlap
+                best_score = (hinted_overlap / hinted_area) + (hinted_overlap / region_area)
+        for sid, mask in sam_masks_raw.items():
+            overlap = int(np.logical_and(mask, region_mask).sum())
+            if overlap <= 0:
+                continue
+            area = max(1, int(mask.sum()))
+            score = (overlap / area) + (overlap / region_area)
+            if score > best_score:
+                best_score = score
+                best_overlap = overlap
+                best_sid = int(sid)
+        if best_sid is None:
+            if prompt_obj_id in sam_masks_raw:
+                best_sid = int(prompt_obj_id)
+            else:
+                self._cancel_entity_lasso_mode(
+                    "No mouse detected inside the selected region.",
+                )
+                return
+
+        selected_mask = sam_masks_raw.get(best_sid)
+        if selected_mask is None:
+            self._cancel_entity_lasso_mode(
+                "No mouse detected inside the selected region.",
+            )
+            return
+        selected_mask = selected_mask.astype(bool)
+        if selected_mask.any():
+            comp_count, comp_labels, comp_stats, _ = cv2.connectedComponentsWithStats(
+                selected_mask.astype(np.uint8),
+                connectivity=8,
+            )
+            if comp_count > 1:
+                best_comp_idx = None
+                best_comp_overlap = 0
+                best_comp_area = 0
+                for comp_idx in range(1, comp_count):
+                    comp_mask = comp_labels == comp_idx
+                    overlap = int(np.logical_and(comp_mask, region_mask).sum())
+                    if overlap <= 0:
+                        continue
+                    area = int(comp_stats[comp_idx, cv2.CC_STAT_AREA])
+                    if (
+                        overlap > best_comp_overlap
+                        or (overlap == best_comp_overlap and area > best_comp_area)
+                    ):
+                        best_comp_overlap = overlap
+                        best_comp_area = area
+                        best_comp_idx = comp_idx
+                if best_comp_idx is not None:
+                    selected_mask = comp_labels == best_comp_idx
+        # In Ctrl-draw region detect mode, keep only pixels inside the user region.
+        selected_mask = np.logical_and(selected_mask, region_mask)
+        if int(selected_mask.sum()) < 20:
+            self._cancel_entity_lasso_mode(
+                "No clear mouse mask found in that region. Draw tighter around one animal.",
+            )
+            return
+
+        used_sids = {int(sid) for sid in mapping_before.values()}
+        if selected_sid_existing is not None:
+            target_sid = int(selected_sid_existing)
+        elif hint_owner_mouse is None:
+            target_sid = int(prompt_obj_id)
+        else:
+            used_sid_masks = {
+                int(sid): np.zeros(frame_shape, dtype=bool) for sid in used_sids
+            }
+            used_sid_masks.update(
+                {int(sid): np.asarray(mask).astype(bool) for sid, mask in current_masks.items()}
+            )
+            target_sid = int(self._next_available_sam_id(used_sid_masks))
+
+        base_mask = current_masks.get(target_sid, base_mask)
+        if add_mode and base_mask is not None:
+            selected_mask = np.logical_or(base_mask.astype(bool), selected_mask.astype(bool))
+
+        self._identity_mgr.assign(mouse_id, target_sid)
+        self.identity_panel.mark_assigned(mouse_id, target_sid)
+        self._size_validator.record(mouse_id, selected_mask)
+
+        mapping = self._identity_mgr.get_full_mapping()
+        stable_sid_masks: dict[int, np.ndarray] = {
+            int(sid): np.asarray(mask).astype(bool) for sid, mask in current_masks.items()
+        }
+        stable_sid_masks[target_sid] = selected_mask
+
+        self._pending_outputs = self._outputs_from_masks(stable_sid_masks)
+        self._prompt_frame_idx = frame_idx
+        sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        if target_sid not in sam_masks:
+            sam_masks[target_sid] = selected_mask
+        # Hide leftover reflection overlays for region-refine mode.
+        self._rejected_masks = {}
+
+        display_masks: dict[int, np.ndarray] = {}
+        for mid, sid in mapping.items():
+            sid = int(sid)
+            if sid in sam_masks:
+                display_masks[mid] = sam_masks[sid]
+        if not display_masks:
+            display_masks = {int(mouse_id): selected_mask}
+        self._all_masks[frame_idx] = display_masks
+
+        if mapping and sam_masks:
+            self._tracker.initialize(frame_idx, sam_masks, mapping)
+
+        prompt = self.action_bar.text_prompt()
+        obj_count = len(self._pending_outputs.get("out_obj_ids", []))
+        self._record_segmentation_example(frame_idx, prompt, obj_count, self._pending_outputs)
+        self._refresh_prompt_assignment_ui(frame_idx, sam_masks)
+
+        entity_name = self.identity_panel.entity_name(mouse_id)
+        self._cancel_entity_lasso_mode(
+            f"Auto-detected {entity_name} in selected region ({int(region_mask.sum())} px).",
+        )
+
     def _start_split_polygon_mode(
         self,
         *,
         freehand: bool = False,
         temporary: bool = False,
     ) -> None:
+        if self._entity_paint_mode:
+            self._cancel_entity_paint_mode(rerender=False)
+        if self._entity_lasso_active:
+            self._cancel_entity_lasso_mode(rerender=False)
         self._split_polygon_active = True
         self._split_polygon_frame_idx = self._current_frame_idx
         self._split_polygon_points.clear()
@@ -721,6 +1436,74 @@ class MainWindow(QMainWindow):
         ys, xs = np.where(mask)
         return float(xs.mean()) if len(xs) > 0 else 0.0
 
+    def _next_available_sam_id(
+        self,
+        masks: Optional[dict[int, np.ndarray]] = None,
+    ) -> int:
+        used_ids: set[int] = set(
+            int(sid) for sid in self._identity_mgr.get_full_mapping().values()
+        )
+        if masks:
+            used_ids.update(int(sid) for sid in masks.keys())
+        return (max(used_ids) + 1) if used_ids else 1
+
+    def _sample_region_prompt_points(
+        self,
+        region_mask: np.ndarray,
+        *,
+        positive_count: int = 7,
+        negative_count: int = 4,
+    ) -> tuple[list[list[float]], list[int]]:
+        import cv2
+
+        mask = np.asarray(region_mask).astype(bool)
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            return [], []
+
+        h, w = mask.shape[:2]
+        points: list[list[float]] = []
+        labels: list[int] = []
+        seen: set[tuple[int, int]] = set()
+
+        def _add_point(px: int, py: int, label: int) -> None:
+            px = int(max(0, min(w - 1, px)))
+            py = int(max(0, min(h - 1, py)))
+            key = (px, py, int(label))
+            if (px, py) in seen:
+                return
+            seen.add((px, py))
+            points.append([float(px), float(py)])
+            labels.append(int(label))
+
+        # Positive centroid
+        cx = int(round(float(xs.mean())))
+        cy = int(round(float(ys.mean())))
+        _add_point(cx, cy, 1)
+
+        # Additional positive points sampled across the region pixels
+        n_pos_extra = max(0, int(positive_count) - 1)
+        if n_pos_extra > 0:
+            order = np.linspace(0, len(xs) - 1, num=min(n_pos_extra, len(xs)), dtype=int)
+            for idx in order:
+                _add_point(int(xs[idx]), int(ys[idx]), 1)
+
+        # Negative points from a dilation ring around the selected region
+        mask_u8 = (mask.astype(np.uint8) * 255)
+        k = max(5, int(max(5, min(h, w) * 0.03)))
+        if k % 2 == 0:
+            k += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dilated = cv2.dilate(mask_u8, kernel, iterations=1) > 0
+        ring = np.logical_and(dilated, np.logical_not(mask))
+        nys, nxs = np.where(ring)
+        if len(nxs) > 0:
+            order = np.linspace(0, len(nxs) - 1, num=min(int(negative_count), len(nxs)), dtype=int)
+            for idx in order:
+                _add_point(int(nxs[idx]), int(nys[idx]), 0)
+
+        return points, labels
+
     def _current_split_source_masks(
         self,
         frame_idx: int,
@@ -858,6 +1641,7 @@ class MainWindow(QMainWindow):
 
         mask_list = mask_list[:best_index] + best_splits + mask_list[best_index + 1:]
         self._cancel_split_polygon_mode(rerender=False)
+        self._push_sam3_undo("split polygon", frame_idx=frame_idx)
         self._commit_split_masks(frame_idx, mask_list, len(masks), n_entities)
 
     # ── Interactive segmentation (click-to-assign) ─────────────────────────────
@@ -867,10 +1651,16 @@ class MainWindow(QMainWindow):
         if not self._video_path:
             QMessageBox.warning(self, "No Video", "Please load a video first.")
             return
+        if self._entity_paint_mode:
+            self.lbl_status.setText("Exit paint mode (Esc) before running Segment.")
+            return
+        self._cancel_entity_paint_mode(rerender=False)
         self._cancel_split_polygon_mode(rerender=False)
+        self._cancel_entity_lasso_mode(rerender=False)
 
         prompt = self.action_bar.text_prompt()
         frame_idx = self._current_frame_idx
+        self._push_sam3_undo(f"segment frame {frame_idx}", frame_idx=frame_idx)
         self._prompt_frame_idx = frame_idx
         self._prompt_points.clear()
         self.progress_widget.set_indeterminate(f"Segmenting frame {frame_idx}…")
@@ -878,6 +1668,22 @@ class MainWindow(QMainWindow):
 
         try:
             if not self._engine.is_loaded():
+                from app.config import get_sam3_checkpoint, set_runtime_sam3_checkpoint
+
+                if not get_sam3_checkpoint():
+                    ckpt_path, _ = QFileDialog.getOpenFileName(
+                        self,
+                        "Select SAM3 Checkpoint",
+                        str(Path(self._video_path).parent if self._video_path else Path.cwd()),
+                        "SAM3 checkpoint (*.pt *.safetensors);;All files (*)",
+                    )
+                    if not ckpt_path:
+                        self.progress_widget.set_determinate()
+                        self.progress_widget.reset("Segmentation canceled")
+                        self.lbl_status.setText("SAM3 checkpoint selection canceled")
+                        return
+                    set_runtime_sam3_checkpoint(ckpt_path)
+
                 self.progress_widget.set_indeterminate("Loading SAM3 model…")
                 self._engine.load_model()
 
@@ -1134,6 +1940,7 @@ class MainWindow(QMainWindow):
 
         # Assign identity and, when possible, swap with the previous owner so a
         # wrong auto-assignment can be corrected with a single click.
+        self._push_sam3_undo(f"assign entity {mouse_id}", frame_idx=self._prompt_frame_idx)
         old_sam_id = self._identity_mgr.sam_id_for_mouse(mouse_id)
         other_mouse_id = self._identity_mgr.mouse_id_for_sam(clicked_sam_id)
         swapped_mouse_id: Optional[int] = None
@@ -1219,7 +2026,11 @@ class MainWindow(QMainWindow):
                 "Assign this entity with a left click before right-click refinement."
             )
             return False
+        if obj_hint is None and point_label == 1:
+            current_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+            obj_hint = self._next_available_sam_id(current_masks)
 
+        self._push_sam3_undo("refine mask with point", frame_idx=self._prompt_frame_idx)
         outputs = self._engine.add_point_prompt(
             0,  # single-frame session always has frame index 0
             [[float(x), float(y)]],
@@ -1301,6 +2112,7 @@ class MainWindow(QMainWindow):
             return
 
         # Store split masks and re-render
+        self._push_sam3_undo("split merged masks", frame_idx=frame_idx)
         self._all_masks[frame_idx] = {i + 1: m for i, m in enumerate(new_masks.values())}
         # Rebuild pending outputs so filter preview and assignment still work
         # Update the SAM outputs to reflect the new mask count
@@ -1360,6 +2172,48 @@ class MainWindow(QMainWindow):
         self._start_split_polygon_mode()
 
     def _on_viewer_lasso_started(self, x: int, y: int) -> None:
+        if self._entity_paint_mode:
+            if (
+                self._entity_paint_frame_idx != self._current_frame_idx
+                or not self._can_begin_entity_paint_mode()
+            ):
+                self._cancel_entity_paint_mode(
+                    "Paint mode cancelled.",
+                    rerender=True,
+                )
+                return
+            selected_mouse = self.identity_panel.selected_mouse()
+            if selected_mouse is None:
+                self._cancel_entity_paint_mode("Select an entity first.", rerender=True)
+                return
+            self._entity_paint_mouse_id = int(selected_mouse)
+            self._entity_paint_points.clear()
+            self._append_entity_paint_point(x, y)
+            self._render_frame(self._current_frame_idx)
+            mode = "add" if self._entity_paint_add_mode else "erase"
+            name = self.identity_panel.entity_name(int(selected_mouse))
+            self.lbl_status.setText(f"Paint {mode} stroke on {name}...")
+            return
+
+        if (not self._split_polygon_active) and self._can_begin_entity_lasso_refine():
+            selected_mouse = self.identity_panel.selected_mouse()
+            if selected_mouse is not None:
+                if (
+                    not self._entity_lasso_active
+                    or self._entity_lasso_frame_idx != self._current_frame_idx
+                    or self._entity_lasso_mouse_id != selected_mouse
+                ):
+                    self._start_entity_lasso_mode(selected_mouse)
+                self._entity_lasso_points.clear()
+                self._append_entity_lasso_point(x, y)
+                self._render_frame(self._current_frame_idx)
+                name = self.identity_panel.entity_name(selected_mouse)
+                mode_text = "add/refine" if self._entity_lasso_add_mode else "detect"
+                self.lbl_status.setText(
+                    f"Region {mode_text} for {name}: release to run SAM3 on this region."
+                )
+                return
+
         if not self._can_begin_split_polygon_mode():
             return
 
@@ -1382,6 +2236,22 @@ class MainWindow(QMainWindow):
 
     def _on_viewer_lasso_moved(self, x: int, y: int) -> None:
         if (
+            self._entity_paint_mode
+            and self._entity_paint_frame_idx == self._current_frame_idx
+        ):
+            if self._append_entity_paint_point(x, y, min_distance=1):
+                self._render_frame(self._current_frame_idx)
+            return
+
+        if (
+            self._entity_lasso_active
+            and self._entity_lasso_frame_idx == self._current_frame_idx
+        ):
+            if self._append_entity_lasso_point(x, y, min_distance=3):
+                self._render_frame(self._current_frame_idx)
+            return
+
+        if (
             not self._split_polygon_active
             or not self._split_polygon_freehand
             or self._split_polygon_frame_idx != self._current_frame_idx
@@ -1392,6 +2262,22 @@ class MainWindow(QMainWindow):
             self._render_frame(self._current_frame_idx)
 
     def _on_viewer_lasso_finished(self, x: int, y: int) -> None:
+        if (
+            self._entity_paint_mode
+            and self._entity_paint_frame_idx == self._current_frame_idx
+        ):
+            self._append_entity_paint_point(x, y, min_distance=1)
+            self._apply_entity_paint_stroke()
+            return
+
+        if (
+            self._entity_lasso_active
+            and self._entity_lasso_frame_idx == self._current_frame_idx
+        ):
+            self._append_entity_lasso_point(x, y, min_distance=1)
+            self._apply_entity_lasso_refine()
+            return
+
         if (
             not self._split_polygon_active
             or not self._split_polygon_freehand
@@ -1482,6 +2368,164 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(image)
         return pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+    @staticmethod
+    def _clone_masks(masks: Optional[dict[int, np.ndarray]]) -> Optional[dict[int, np.ndarray]]:
+        if masks is None:
+            return None
+        return {int(k): np.array(v, copy=True) for k, v in masks.items()}
+
+    @staticmethod
+    def _clone_outputs(outputs: Optional[dict]) -> Optional[dict]:
+        if outputs is None:
+            return None
+        clone: dict = {}
+        for key, value in outputs.items():
+            if isinstance(value, np.ndarray):
+                clone[key] = np.array(value, copy=True)
+            else:
+                clone[key] = copy.deepcopy(value)
+        return clone
+
+    def _clone_example_entry(self, entry: Optional[dict]) -> Optional[dict]:
+        if entry is None:
+            return None
+        cloned: dict = {}
+        for key, value in entry.items():
+            if key == "outputs":
+                cloned[key] = self._clone_outputs(value)
+            elif isinstance(value, np.ndarray):
+                cloned[key] = np.array(value, copy=True)
+            else:
+                cloned[key] = copy.deepcopy(value)
+        return cloned
+
+    def _capture_sam3_snapshot(self, frame_idx: int, action: str) -> dict:
+        frame_idx = int(frame_idx)
+        frame_entry = self._segmentation_examples.get(frame_idx)
+        entry_outputs = frame_entry.get("outputs") if frame_entry else None
+        pending_outputs = (
+            self._pending_outputs
+            if self._prompt_frame_idx == frame_idx
+            else entry_outputs
+        )
+        rejected_masks = self._rejected_masks if self._prompt_frame_idx == frame_idx else {}
+        prompt_points = self._prompt_points if self._prompt_frame_idx == frame_idx else []
+        return {
+            "action": str(action).strip() or "SAM3 edit",
+            "frame_idx": frame_idx,
+            "prompt_frame_idx": frame_idx,
+            "pending_outputs": self._clone_outputs(pending_outputs),
+            "frame_masks": self._clone_masks(self._all_masks.get(frame_idx)),
+            "identity_mapping": dict(self._identity_mgr.get_full_mapping()),
+            "rejected_masks": self._clone_masks(rejected_masks) or {},
+            "prompt_points": list(prompt_points),
+            "example_entry": self._clone_example_entry(frame_entry),
+        }
+
+    def _update_undo_redo_state(self) -> None:
+        frame_idx = int(self._current_frame_idx)
+        can_undo = bool(self._sam3_undo_by_frame.get(frame_idx))
+        can_redo = bool(self._sam3_redo_by_frame.get(frame_idx))
+        self.action_bar.set_undo_redo_enabled(can_undo, can_redo)
+
+    def _push_sam3_undo(self, action: str, frame_idx: Optional[int] = None) -> None:
+        target_frame = int(self._current_frame_idx if frame_idx is None else frame_idx)
+        snapshot = self._capture_sam3_snapshot(target_frame, action)
+        undo_stack = self._sam3_undo_by_frame.setdefault(target_frame, [])
+        undo_stack.append(snapshot)
+        if len(undo_stack) > 50:
+            undo_stack.pop(0)
+        self._sam3_redo_by_frame[target_frame] = []
+        self._update_undo_redo_state()
+
+    def _restore_sam3_snapshot(self, snapshot: dict) -> None:
+        frame_idx = int(snapshot.get("frame_idx", self._prompt_frame_idx))
+        self._prompt_frame_idx = int(snapshot.get("prompt_frame_idx", frame_idx))
+        self._pending_outputs = self._clone_outputs(snapshot.get("pending_outputs"))
+        self._rejected_masks = self._clone_masks(snapshot.get("rejected_masks")) or {}
+        self._prompt_points = list(snapshot.get("prompt_points") or [])
+
+        restored_masks = self._clone_masks(snapshot.get("frame_masks"))
+        if restored_masks is None:
+            self._all_masks.pop(frame_idx, None)
+        else:
+            self._all_masks[frame_idx] = restored_masks
+
+        example_entry = self._clone_example_entry(snapshot.get("example_entry"))
+        if example_entry is None:
+            self._segmentation_examples.pop(frame_idx, None)
+            self.examples_panel.remove_example(frame_idx)
+        else:
+            self._segmentation_examples[frame_idx] = example_entry
+            thumb = None
+            if self._video_reader is not None:
+                frame = self._video_reader.read_frame(frame_idx)
+                thumb = self._make_thumbnail_pixmap(frame) if frame is not None else None
+            self.examples_panel.upsert_example(frame_idx, thumb)
+
+        self._identity_mgr.reset()
+        self._identity_mgr.set_n_mice(self.identity_panel.entity_count())
+        restored_mapping = {}
+        for eid, sid in dict(snapshot.get("identity_mapping") or {}).items():
+            eid = int(eid)
+            sid = int(sid)
+            if eid in self.identity_panel._entities:
+                self._identity_mgr.assign(eid, sid)
+                restored_mapping[eid] = sid
+        self.identity_panel.sync_assignments(restored_mapping)
+
+        if self._pending_outputs is not None and self._video_reader is not None:
+            info = self._video_reader.info
+            frame_shape = (info.height, info.width)
+            sam_masks, rejected = self._to_filtered_masks(self._pending_outputs, frame_shape)
+            self._rejected_masks = rejected
+            self._refresh_prompt_assignment_ui(frame_idx, sam_masks)
+            if restored_mapping and sam_masks:
+                self._tracker.initialize(frame_idx, sam_masks, restored_mapping)
+        else:
+            self.identity_panel.clear_detection_status()
+            self._update_example_assignment_note(frame_idx)
+            self._update_assignment_cursor()
+
+        self._render_frame(self._current_frame_idx)
+        self._update_undo_redo_state()
+
+    def _undo_last_sam3_action(self) -> None:
+        frame_idx = int(self._current_frame_idx)
+        undo_stack = self._sam3_undo_by_frame.get(frame_idx)
+        if not undo_stack:
+            self.lbl_status.setText("Nothing to undo.")
+            self._update_undo_redo_state()
+            return
+
+        snapshot = undo_stack.pop()
+        redo_snapshot = self._capture_sam3_snapshot(frame_idx, f"redo {snapshot.get('action', '')}".strip())
+        redo_stack = self._sam3_redo_by_frame.setdefault(frame_idx, [])
+        redo_stack.append(redo_snapshot)
+        if len(redo_stack) > 50:
+            redo_stack.pop(0)
+        self._restore_sam3_snapshot(snapshot)
+        action = str(snapshot.get("action") or "SAM3 edit")
+        self.lbl_status.setText(f"Undid: {action}")
+
+    def _redo_last_sam3_action(self) -> None:
+        frame_idx = int(self._current_frame_idx)
+        redo_stack = self._sam3_redo_by_frame.get(frame_idx)
+        if not redo_stack:
+            self.lbl_status.setText("Nothing to redo.")
+            self._update_undo_redo_state()
+            return
+
+        snapshot = redo_stack.pop()
+        undo_snapshot = self._capture_sam3_snapshot(frame_idx, f"undo {snapshot.get('action', '')}".strip())
+        undo_stack = self._sam3_undo_by_frame.setdefault(frame_idx, [])
+        undo_stack.append(undo_snapshot)
+        if len(undo_stack) > 50:
+            undo_stack.pop(0)
+        self._restore_sam3_snapshot(snapshot)
+        action = str(snapshot.get("action") or "SAM3 edit")
+        self.lbl_status.setText(f"Redid: {action}")
+
     def _outputs_from_masks(self, masks: dict[int, np.ndarray]) -> dict:
         out_ids: list[int] = []
         out_masks: list[np.ndarray] = []
@@ -1562,7 +2606,9 @@ class MainWindow(QMainWindow):
         self._update_example_assignment_note(frame_idx, len(sam_masks))
 
         next_unassigned = self._next_unassigned_entity_id()
-        if next_unassigned is not None:
+        if self._entity_paint_mode and self._entity_paint_mouse_id is not None:
+            self.identity_panel.select_entity(int(self._entity_paint_mouse_id))
+        elif next_unassigned is not None:
             self.identity_panel.select_entity(next_unassigned)
 
         self._update_assignment_cursor()
@@ -1605,21 +2651,29 @@ class MainWindow(QMainWindow):
     def _on_example_remove_requested(self, frame_idx: int) -> None:
         if self._split_polygon_frame_idx == frame_idx:
             self._cancel_split_polygon_mode(rerender=False)
+        if self._entity_lasso_frame_idx == frame_idx:
+            self._cancel_entity_lasso_mode(rerender=False)
         self.examples_panel.remove_example(frame_idx)
         self._segmentation_examples.pop(frame_idx, None)
         self._all_masks.pop(frame_idx, None)
+        self._sam3_undo_by_frame.pop(int(frame_idx), None)
+        self._sam3_redo_by_frame.pop(int(frame_idx), None)
         if frame_idx == self._prompt_frame_idx:
             self._engine.close_session()
             self._pending_outputs = None
             self._prompt_frame_idx = self._current_frame_idx
         self._render_frame(self._current_frame_idx)
+        self._update_undo_redo_state()
         self.lbl_status.setText(f"Removed example frame {frame_idx}")
 
     def _on_examples_clear_requested(self) -> None:
         self._cancel_split_polygon_mode(rerender=False)
+        self._cancel_entity_lasso_mode(rerender=False)
         for frame_idx in list(self._segmentation_examples.keys()):
             self._all_masks.pop(frame_idx, None)
         self._segmentation_examples.clear()
+        self._sam3_undo_by_frame.clear()
+        self._sam3_redo_by_frame.clear()
         self.examples_panel.clear_examples()
         self._pending_outputs = None
         self._prompt_frame_idx = self._current_frame_idx
@@ -1629,6 +2683,7 @@ class MainWindow(QMainWindow):
             self._identity_mgr.reset()
             self.identity_panel.reset()
         self._render_frame(self._current_frame_idx)
+        self._update_undo_redo_state()
         self.lbl_status.setText("Segmentation examples cleared")
 
     def _on_capture_frame(self) -> None:
@@ -1897,9 +2952,36 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
             return
 
+        if event.matches(QKeySequence.StandardKey.Undo) and not event.isAutoRepeat():
+            self._undo_last_sam3_action()
+            return
+        if event.matches(QKeySequence.StandardKey.Redo) and not event.isAutoRepeat():
+            self._redo_last_sam3_action()
+            return
+
         key = int(event.key())
         if key == int(Qt.Key_Escape) and self._split_polygon_active:
             self._cancel_split_polygon_mode("Split mode cancelled.")
+        elif key == int(Qt.Key_Escape) and self._entity_lasso_active:
+            self._cancel_entity_lasso_mode("Region refine cancelled.")
+        elif key == int(Qt.Key_Escape) and self._entity_paint_mode:
+            self._cancel_entity_paint_mode("Paint mode cancelled.", rerender=True)
+        elif key == int(Qt.Key_P) and not event.isAutoRepeat():
+            self._start_entity_paint_mode(add_mode=True)
+        elif key == int(Qt.Key_C) and not event.isAutoRepeat():
+            self._start_entity_paint_mode(add_mode=False)
+        elif (
+            (event.modifiers() & Qt.ControlModifier)
+            and key in (int(Qt.Key_Plus), int(Qt.Key_Equal))
+            and self._can_begin_entity_lasso_refine()
+        ):
+            mouse_id = self.identity_panel.selected_mouse()
+            if mouse_id is not None:
+                self._entity_lasso_add_mode = True
+                name = self.identity_panel.entity_name(mouse_id)
+                self.lbl_status.setText(
+                    f"Add mode for {name}: next Ctrl-drag will add this region."
+                )
         elif key in self._entity_keys and not event.isAutoRepeat():
             n = self._entity_keys[key]
             if self.identity_panel.select_nth_entity(n):
@@ -1914,7 +2996,10 @@ class MainWindow(QMainWindow):
         elif key == int(Qt.Key_Left):
             self._step_frame(-1)
         elif key == int(Qt.Key_S) and not event.isAutoRepeat():
-            self._run_text_prompt()
+            if self._entity_paint_mode:
+                self.lbl_status.setText("Exit paint mode (Esc) before running Segment.")
+            else:
+                self._run_text_prompt()
         else:
             super().keyPressEvent(event)
 
