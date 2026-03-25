@@ -578,6 +578,13 @@ class MainWindow(QMainWindow):
         frame = frame.copy()
         h, w = frame.shape[:2]
 
+        # Keep paint-mode canvas unobstructed by SAM prompt text overlays.
+        if (
+            self._entity_paint_mode
+            and self._entity_paint_frame_idx == self._current_frame_idx
+        ):
+            return frame
+
         # Choose banner text/colour based on assignment state
         selected = self.identity_panel.selected_mouse()
         n_assigned = self.identity_panel.assigned_count()
@@ -849,24 +856,6 @@ class MainWindow(QMainWindow):
             x, y = self._entity_paint_points[-1]
             cv2.circle(out, (int(x), int(y)), int(radius), accent, 1)
             cv2.circle(out, (int(x), int(y)), 3, accent, -1)
-
-        name = ""
-        if self._entity_paint_mouse_id is not None:
-            name = self.identity_panel.entity_name(self._entity_paint_mouse_id)
-        mode_badge = "PAINT +" if self._entity_paint_add_mode else "PAINT -"
-        badge = f"{mode_badge} {name}  size {radius}px  drag to draw  Esc to exit"
-        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-        cv2.rectangle(out, (8, 30), (18 + tw, 40 + th), (12, 22, 12), -1)
-        cv2.putText(
-            out,
-            badge,
-            (14, 36 + th),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            accent,
-            1,
-            cv2.LINE_AA,
-        )
         return out
 
     def _apply_entity_paint_stroke(self) -> None:
