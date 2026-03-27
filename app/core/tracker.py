@@ -183,6 +183,10 @@ class IdentityTracker:
             if i < len(probs_arr):
                 curr_probs[sid] = float(np.mean(probs_arr[i]))
 
+        # Some SAM3 builds return saturated confidence (all 1.0). In that case,
+        # use geometric matching quality as the confidence signal instead.
+        has_informative_probs = self._has_informative_probs(curr_probs)
+
         if mask_filter_fn is not None and curr_sam_masks:
             curr_sam_masks = mask_filter_fn(curr_sam_masks)
 
@@ -210,7 +214,10 @@ class IdentityTracker:
                 state.masks[mouse_id] = mask
                 state.centroids[mouse_id] = _centroid(mask)
                 state.bboxes[mouse_id] = curr_bboxes.get(sid, (0, 0, 0, 0))
-                state.confidences[mouse_id] = curr_probs.get(sid, 1.0)
+                raw_prob = curr_probs.get(sid) if has_informative_probs else None
+                state.confidences[mouse_id] = (
+                    self._clip01(raw_prob) if raw_prob is not None else 0.95
+                )
                 self._absent_frames[mouse_id] = 0
                 self._occlusion_states[mouse_id] = "visible"
             self._last_state = state
@@ -259,12 +266,20 @@ class IdentityTracker:
             state.masks[mouse_id] = mask
             state.centroids[mouse_id] = _centroid(mask)
             state.bboxes[mouse_id] = curr_bboxes.get(sam_id, (0, 0, 0, 0))
-            state.confidences[mouse_id] = curr_probs.get(sam_id, 1.0)
-            if sam_id in synthetic_sam_ids:
-                state.merge_resolved_ids.add(mouse_id)
             r = prev_ids.index(mouse_id)
             c = curr_sam_ids.index(sam_id)
-            max_cost = max(max_cost, cost[r, c])
+            match_cost = float(cost[r, c])
+            max_cost = max(max_cost, match_cost)
+            geom_conf = self._cost_to_confidence(match_cost)
+            raw_prob = curr_probs.get(sam_id) if has_informative_probs else None
+            if raw_prob is not None:
+                # Blend model score with assignment quality for stability.
+                conf = 0.7 * self._clip01(raw_prob) + 0.3 * geom_conf
+            else:
+                conf = geom_conf
+            state.confidences[mouse_id] = self._clip01(conf)
+            if sam_id in synthetic_sam_ids:
+                state.merge_resolved_ids.add(mouse_id)
             self._absent_frames[mouse_id] = 0
             self._occlusion_states[mouse_id] = "visible"
 
@@ -332,6 +347,30 @@ class IdentityTracker:
 
         self.history.append(state)
         return state
+
+    @staticmethod
+    def _clip01(value: Optional[float]) -> float:
+        if value is None:
+            return 0.0
+        return float(max(0.0, min(1.0, float(value))))
+
+    @staticmethod
+    def _has_informative_probs(curr_probs: dict[int, float]) -> bool:
+        if not curr_probs:
+            return False
+        vals = np.asarray(list(curr_probs.values()), dtype=np.float32)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return False
+        spread = float(vals.max() - vals.min())
+        mean_val = float(vals.mean())
+        # Treat "all ~1.0" as non-informative saturation.
+        return spread > 1e-3 or mean_val < 0.995
+
+    @staticmethod
+    def _cost_to_confidence(cost: float) -> float:
+        # Cost 0 -> 1.0, cost 1 -> ~0.37, higher costs decay smoothly.
+        return float(np.exp(-max(0.0, float(cost))))
 
     def detect_velocity_swaps(
         self,

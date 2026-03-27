@@ -878,7 +878,8 @@ class MainWindow(QMainWindow):
 
         frame_idx = self._current_frame_idx
         frame_shape = (self._video_reader.info.height, self._video_reader.info.width)
-        sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        sam_masks = self._engine.outputs_to_masks(self._pending_outputs, frame_shape)
+        sam_masks = {int(sid): np.asarray(mask).astype(bool) for sid, mask in sam_masks.items()}
         mapping = self._identity_mgr.get_full_mapping()
         target_sid = mapping.get(int(mouse_id))
         if target_sid is None:
@@ -937,14 +938,24 @@ class MainWindow(QMainWindow):
 
         self._pending_outputs = self._outputs_from_masks(nonempty_sid_masks)
         self._prompt_frame_idx = frame_idx
-        self._rejected_masks = {}
+        sam_masks_filtered, rejected = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        for sid in mapping.values():
+            sid = int(sid)
+            if sid not in sam_masks_filtered and sid in nonempty_sid_masks:
+                sam_masks_filtered[sid] = nonempty_sid_masks[sid]
+        assigned_sids = {int(sid) for sid in mapping.values()}
+        self._rejected_masks = {
+            int(sid): np.asarray(mask).astype(bool)
+            for sid, mask in rejected.items()
+            if int(sid) not in assigned_sids
+        }
         if edited_mask.any():
             self._size_validator.record(int(mouse_id), edited_mask)
 
         display_masks: dict[int, np.ndarray] = {}
         for mid, sid in mapping.items():
             sid = int(sid)
-            mask = nonempty_sid_masks.get(sid)
+            mask = sam_masks_filtered.get(sid)
             if mask is not None:
                 display_masks[int(mid)] = mask
         self._all_masks[frame_idx] = display_masks
@@ -955,7 +966,7 @@ class MainWindow(QMainWindow):
         prompt = self.action_bar.text_prompt()
         obj_count = len(self._pending_outputs.get("out_obj_ids", []))
         self._record_segmentation_example(frame_idx, prompt, obj_count, self._pending_outputs)
-        self._refresh_prompt_assignment_ui(frame_idx, nonempty_sid_masks)
+        self._refresh_prompt_assignment_ui(frame_idx, sam_masks_filtered)
 
         self._entity_paint_points.clear()
         self._render_frame(frame_idx)
@@ -1061,7 +1072,11 @@ class MainWindow(QMainWindow):
 
         current_masks: dict[int, np.ndarray] = {}
         if previous_outputs is not None:
-            current_masks, _ = self._to_filtered_masks(previous_outputs, frame_shape)
+            current_masks = self._engine.outputs_to_masks(previous_outputs, frame_shape)
+            current_masks = {
+                int(sid): np.asarray(mask).astype(bool)
+                for sid, mask in current_masks.items()
+            }
 
         try:
             if not self._engine.is_loaded():
@@ -1254,6 +1269,10 @@ class MainWindow(QMainWindow):
         self._pending_outputs = self._outputs_from_masks(stable_sid_masks)
         self._prompt_frame_idx = frame_idx
         sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        for sid in mapping.values():
+            sid = int(sid)
+            if sid not in sam_masks and sid in stable_sid_masks:
+                sam_masks[sid] = stable_sid_masks[sid]
         if target_sid not in sam_masks:
             sam_masks[target_sid] = selected_mask
         # Hide leftover reflection overlays for region-refine mode.
@@ -1268,8 +1287,8 @@ class MainWindow(QMainWindow):
             display_masks = {int(mouse_id): selected_mask}
         self._all_masks[frame_idx] = display_masks
 
-        if mapping and sam_masks:
-            self._tracker.initialize(frame_idx, sam_masks, mapping)
+        if mapping and stable_sid_masks:
+            self._tracker.initialize(frame_idx, stable_sid_masks, mapping)
 
         prompt = self.action_bar.text_prompt()
         obj_count = len(self._pending_outputs.get("out_obj_ids", []))
@@ -1908,6 +1927,11 @@ class MainWindow(QMainWindow):
         info = self._video_reader.info
         frame_shape = (info.height, info.width)
         sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+        raw_masks = self._engine.outputs_to_masks(self._pending_outputs, frame_shape)
+        for sid in self._identity_mgr.get_full_mapping().values():
+            sid = int(sid)
+            if sid not in sam_masks and sid in raw_masks:
+                sam_masks[sid] = np.asarray(raw_masks[sid]).astype(bool)
 
         # Find which SAM mask contains this click
         clicked_sam_id = None
@@ -1921,6 +1945,11 @@ class MainWindow(QMainWindow):
             if not self._refine_mask_with_point(x, y, mouse_id, point_label=1):
                 return
             sam_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
+            raw_masks = self._engine.outputs_to_masks(self._pending_outputs, frame_shape)
+            for sid in self._identity_mgr.get_full_mapping().values():
+                sid = int(sid)
+                if sid not in sam_masks and sid in raw_masks:
+                    sam_masks[sid] = np.asarray(raw_masks[sid]).astype(bool)
             for sam_id, mask in sam_masks.items():
                 if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] and mask[y, x]:
                     clicked_sam_id = sam_id
@@ -2020,9 +2049,65 @@ class MainWindow(QMainWindow):
                 "Assign this entity with a left click before right-click refinement."
             )
             return False
+        previous_masks_raw = self._engine.outputs_to_masks(self._pending_outputs, frame_shape)
+        previous_masks_raw = {
+            int(sid): np.asarray(mask).astype(bool)
+            for sid, mask in previous_masks_raw.items()
+        }
         if obj_hint is None and point_label == 1:
-            current_masks, _ = self._to_filtered_masks(self._pending_outputs, frame_shape)
-            obj_hint = self._next_available_sam_id(current_masks)
+            obj_hint = self._next_available_sam_id(previous_masks_raw)
+
+        def _mask_component_near_point(mask: np.ndarray) -> np.ndarray:
+            import cv2
+
+            binary = np.asarray(mask).astype(bool)
+            if not binary.any():
+                return binary
+            h, w = binary.shape[:2]
+            if not (0 <= x < w and 0 <= y < h):
+                return binary
+
+            comp_count, comp_labels, comp_stats, comp_centroids = cv2.connectedComponentsWithStats(
+                binary.astype(np.uint8),
+                connectivity=8,
+            )
+            if comp_count <= 1:
+                return binary
+
+            anchor_label = int(comp_labels[y, x])
+            if anchor_label > 0:
+                return comp_labels == anchor_label
+
+            best_idx: Optional[int] = None
+            best_dist = float("inf")
+            for comp_idx in range(1, comp_count):
+                area = int(comp_stats[comp_idx, cv2.CC_STAT_AREA])
+                if area <= 0:
+                    continue
+                cx, cy = comp_centroids[comp_idx]
+                dist = (float(cx) - float(x)) ** 2 + (float(cy) - float(y)) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = comp_idx
+            if best_idx is None:
+                return binary
+            return comp_labels == int(best_idx)
+
+        def _merge_local_delta(previous_mask: np.ndarray, refined_mask: np.ndarray) -> np.ndarray:
+            previous = np.asarray(previous_mask).astype(bool)
+            refined = np.asarray(refined_mask).astype(bool)
+            delta = np.logical_xor(previous, refined)
+            if not delta.any():
+                return refined
+            local_delta = _mask_component_near_point(delta)
+            merged = previous.copy()
+            merged[local_delta] = refined[local_delta]
+            return merged
+
+        stable_sid_masks: dict[int, np.ndarray] = {
+            int(sid): np.asarray(mask).astype(bool)
+            for sid, mask in previous_masks_raw.items()
+        }
 
         self._push_sam3_undo("refine mask with point", frame_idx=self._prompt_frame_idx)
         outputs = self._engine.add_point_prompt(
@@ -2032,12 +2117,65 @@ class MainWindow(QMainWindow):
             obj_id=obj_hint,
             frame_shape=frame_shape,
         )
-        self._pending_outputs = outputs
         self._prompt_points.append((x, y, point_label))
-        sam_masks, rejected = self._to_filtered_masks(outputs, frame_shape)
-        self._rejected_masks = rejected
+        refined_masks = self._engine.outputs_to_masks(outputs, frame_shape)
+        refined_masks = {
+            int(sid): np.asarray(mask).astype(bool)
+            for sid, mask in refined_masks.items()
+        }
 
+        target_sid: Optional[int] = None
+        if obj_hint is not None and int(obj_hint) in refined_masks:
+            target_sid = int(obj_hint)
+        if target_sid is None:
+            for sid, mask in refined_masks.items():
+                if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] and bool(mask[y, x]):
+                    target_sid = int(sid)
+                    break
+        if target_sid is None and refined_masks:
+            h, w = frame_shape
+            radius = 8
+            x1 = max(0, int(x) - radius)
+            y1 = max(0, int(y) - radius)
+            x2 = min(int(w), int(x) + radius + 1)
+            y2 = min(int(h), int(y) + radius + 1)
+            best_sid: Optional[int] = None
+            best_score = -1
+            for sid, mask in refined_masks.items():
+                score = int(mask[y1:y2, x1:x2].sum())
+                if score > best_score:
+                    best_score = score
+                    best_sid = int(sid)
+            target_sid = best_sid
+        if target_sid is None and refined_masks:
+            target_sid = int(next(iter(refined_masks.keys())))
+
+        if target_sid is not None:
+            base_mask = stable_sid_masks.get(int(target_sid), np.zeros(frame_shape, dtype=bool))
+            refined_target = refined_masks.get(int(target_sid), np.zeros(frame_shape, dtype=bool))
+            refined_target = _mask_component_near_point(refined_target)
+            merged_target = _merge_local_delta(base_mask, refined_target)
+            stable_sid_masks[int(target_sid)] = merged_target
+
+        stable_sid_masks = {
+            int(sid): np.asarray(mask).astype(bool)
+            for sid, mask in stable_sid_masks.items()
+            if int(np.asarray(mask).sum()) > 0
+        }
+        self._pending_outputs = self._outputs_from_masks(stable_sid_masks)
+        sam_masks, rejected = self._to_filtered_masks(self._pending_outputs, frame_shape)
         mapping = self._identity_mgr.get_full_mapping()
+        for sid in mapping.values():
+            sid = int(sid)
+            if sid not in sam_masks and sid in stable_sid_masks:
+                sam_masks[sid] = stable_sid_masks[sid]
+        assigned_sids = {int(sid) for sid in mapping.values()}
+        self._rejected_masks = {
+            int(sid): np.asarray(mask).astype(bool)
+            for sid, mask in rejected.items()
+            if int(sid) not in assigned_sids
+        }
+
         display_masks: dict[int, np.ndarray] = {}
         for mid, sid in mapping.items():
             if sid in sam_masks:
@@ -2049,8 +2187,13 @@ class MainWindow(QMainWindow):
         self._render_frame(self._prompt_frame_idx)
 
         prompt = self.action_bar.text_prompt()
-        obj_count = len(outputs.get("out_obj_ids", []))
-        self._record_segmentation_example(self._prompt_frame_idx, prompt, obj_count, outputs)
+        obj_count = len(self._pending_outputs.get("out_obj_ids", []))
+        self._record_segmentation_example(
+            self._prompt_frame_idx,
+            prompt,
+            obj_count,
+            self._pending_outputs,
+        )
 
         action = "foreground" if point_label == 1 else "background"
         self.lbl_status.setText(f"Added {action} refinement point at ({x}, {y})")
